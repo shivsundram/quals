@@ -102,9 +102,12 @@ Plus, off the workspace:
 ## 3. One-shot bootstrap (fresh machine)
 
 ```bash
-# (a) Get the workspace.
-git clone <wherever>/quals.git
+# (a) Get the workspace. lastz is a submodule pinned at our patched fork.
+git clone --recurse-submodules git@github.com:shivsundram/quals.git
 cd quals
+
+# If you forgot --recurse-submodules:
+#     git submodule update --init --recursive
 
 # (b) Build both lastz binaries (production + stage-timer instrumented).
 make -C lastz                           # → lastz/src/lastz, lastz_D
