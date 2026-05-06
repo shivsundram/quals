@@ -1,0 +1,29 @@
+#:lav
+d {
+  "lastz.v1.04.57 /home/shiv1/quals/bench/data_real/actb_fly.fa /home/shiv1/quals/bench/data_real/actb_fly.fa --output=/home/shiv1/quals/bench/results/actb-default/runs/real.actb_fly_vs_fly__default__0.lastz_out 
+     A    C    G    T
+    91 -114  -31 -123
+  -114  100 -125  -31
+   -31 -125  100 -114
+  -123  -31 -114   91
+  O = 400, E = 30, K = 3000, L = 3000, M = 0"
+}
+#:lav
+s {
+  "/home/shiv1/quals/bench/data_real/actb_fly.fa" 1 1928 0 1
+  "/home/shiv1/quals/bench/data_real/actb_fly.fa" 1 1928 0 1
+}
+h {
+   ">fly_Act5C_NM_001014725.2 Drosophila melanogaster"
+   ">fly_Act5C_NM_001014725.2 Drosophila melanogaster"
+}
+a {
+  s 184160
+  b 1 1
+  e 1928 1928
+  l 1 1 1928 1928 100
+}
+m {
+  n 0
+}
+#:eof

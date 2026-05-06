@@ -1,0 +1,24 @@
+===STAGE_TIMING_BEGIN===
+total run time:            63.878
+sequence 1 I/O:            0.146
+seed position table:       0.420
+sequence 2 I/O:            0.143
+seed hit search:           46.104
+chaining:                  0.000
+gapped extension:          17.033
+interpolation:             0.000
+output:                    0.027
+total query time:          63.311
+queries:                   1
+per query (with I/O):      63.311 (0.0 per second)
+per query (w/o input):     63.167 (0.0 per second)
+total time in above_below(): 0.000
+total time in left_right(): 0.000
+total time in ydrop_align(): 16.017
+    ydrop_one_sided_align(): 16.017
+    update_lr_bounds():    0.200
+    next_sweep_seg():      0.000
+    prev_sweep_seg():      0.000
+    update_active_segs():  0.595
+    filter_active_segs():  0.198
+===STAGE_TIMING_END===

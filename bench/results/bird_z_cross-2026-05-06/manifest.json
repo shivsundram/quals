@@ -1,0 +1,32 @@
+{
+  "hostname": "g0002.stanford.edu",
+  "platform": "Linux-5.4.0-200-generic-x86_64-with-glibc2.31",
+  "python": "3.11.5",
+  "cpu_count": 40,
+  "lastz_path": "/home/shiv1/quals/lastz/src/lastz_T",
+  "lastz_instrumented": true,
+  "lastz_version": "lastz (version 1.04.57 released 20260505)\n  score=int, sequence=31-bit, alloc=32-bit, allowBackToBackGaps=OFF\n  built with gcc-9.4.0 \"9.4.0\"",
+  "argv": [
+    "bench.py",
+    "--suite",
+    "bird_z_cross",
+    "--reps",
+    "1",
+    "--pin-cpu",
+    "0",
+    "--run-name",
+    "bird_z_cross-2026-05-06"
+  ],
+  "reps": 1,
+  "warmup": 1,
+  "pin_cpu": 0,
+  "timeout_s": null,
+  "keep_output": false,
+  "started_at": "2026-05-06T15:58:01-0700",
+  "cells": [
+    {
+      "workload": "real.galGal6_vs_taeGut2_chrZ",
+      "variant": "segalign_default"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+workload,variant,n_reps,ok,wall_s_min,wall_s_median,wall_s_max,user_s_median,sys_s_median,cpu_pct_median,max_rss_kb_median,page_faults_major_median,page_faults_minor_median,output_bytes_median
+static.pseudocat_vs_pseudopig,chain,3,1,0.17,0.17,0.22,0.14,0.02,100,28492,0,22940,9330
+static.pseudocat_vs_pseudopig,default,3,1,0.29,0.29,0.29,0.27,0.02,100,28516,0,22940,13292
+static.pseudocat_vs_pseudopig,nogapped,3,1,0.04,0.04,0.04,0.01,0.02,97,26300,0,22390,3122
+static.pseudopig_self,default,3,0,0.0,0.0,0.0,0.0,0.0,100,3088,0,267,0
+static.reads_vs_pseudopig,default,3,0,0.0,0.0,0.0,0.0,0.0,100,3084,0,266,0

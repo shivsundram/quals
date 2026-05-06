@@ -1,0 +1,45 @@
+{
+  "hostname": "sapling2.stanford.edu",
+  "platform": "Linux-5.4.0-216-generic-x86_64-with-glibc2.31",
+  "python": "3.11.5",
+  "cpu_count": 40,
+  "lastz_path": "/home/shiv1/quals/lastz/src/lastz",
+  "lastz_version": "lastz (version 1.04.57 released 20260505)\n  score=int, sequence=31-bit, alloc=32-bit, allowBackToBackGaps=OFF\n  built with gcc-9.4.0 \"9.4.0\"",
+  "argv": [
+    "bench/bench.py",
+    "--suite",
+    "scaling",
+    "--reps",
+    "3",
+    "--warmup",
+    "1",
+    "--pin-cpu",
+    "0",
+    "--run-name",
+    "scaling-v1"
+  ],
+  "reps": 3,
+  "warmup": 1,
+  "pin_cpu": 0,
+  "timeout_s": null,
+  "keep_output": false,
+  "started_at": "2026-05-06T14:43:54-0700",
+  "cells": [
+    {
+      "workload": "synth.uniform_10kb",
+      "variant": "default"
+    },
+    {
+      "workload": "synth.uniform_100kb",
+      "variant": "default"
+    },
+    {
+      "workload": "synth.uniform_1000kb",
+      "variant": "default"
+    },
+    {
+      "workload": "synth.uniform_10000kb",
+      "variant": "default"
+    }
+  ]
+}

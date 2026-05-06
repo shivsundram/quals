@@ -1,0 +1,5 @@
+workload,variant,n_reps,ok,wall_s_min,wall_s_median,wall_s_max,user_s_median,sys_s_median,cpu_pct_median,max_rss_kb_median,page_faults_major_median,page_faults_minor_median,output_bytes_median
+synth.uniform_10000kb,default,3,1,60.45,60.95,61.05,60.81,0.1,99,252448,0,81678,3657502
+synth.uniform_1000kb,default,3,1,2.43,2.46,2.46,2.39,0.06,99,162128,0,56626,325266
+synth.uniform_100kb,default,3,1,0.24,0.24,0.25,0.2,0.04,99,103564,0,41706,28357
+synth.uniform_10kb,default,3,1,0.04,0.04,0.04,0.02,0.01,100,37044,0,25077,2993

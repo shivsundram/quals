@@ -1,0 +1,30 @@
+#:lav
+d {
+  "lastz.v1.04.57 /home/shiv1/quals/bench/data_real/actb_chimp.fa /home/shiv1/quals/bench/data_real/actb_human.fa --output=/home/shiv1/quals/bench/results/actb-default/runs/real.actb_chimp_vs_human__default__2.lastz_out 
+     A    C    G    T
+    91 -114  -31 -123
+  -114  100 -125  -31
+   -31 -125  100 -114
+  -123  -31 -114   91
+  O = 400, E = 30, K = 3000, L = 3000, M = 0"
+}
+#:lav
+s {
+  "/home/shiv1/quals/bench/data_real/actb_chimp.fa" 1 1847 0 1
+  "/home/shiv1/quals/bench/data_real/actb_human.fa" 1 1812 0 1
+}
+h {
+   ">chimp_ACTB_NM_001009945.2 Pan troglodytes"
+   ">human_ACTB_NM_001101.5 Homo sapiens"
+}
+a {
+  s 171505
+  b 27 1
+  e 1834 1809
+  l 27 1 1346 1320 99
+  l 1347 1322 1834 1809 99
+}
+m {
+  n 0
+}
+#:eof

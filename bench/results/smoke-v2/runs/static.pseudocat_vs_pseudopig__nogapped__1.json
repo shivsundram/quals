@@ -1,0 +1,41 @@
+{
+  "workload": "static.pseudocat_vs_pseudopig",
+  "variant": "nogapped",
+  "rep": 1,
+  "cmd": [
+    "taskset",
+    "-c",
+    "0",
+    "/usr/bin/time",
+    "-v",
+    "/home/shiv1/quals/lastz/src/lastz",
+    "/home/shiv1/quals/lastz/test_data/pseudocat.fa",
+    "/home/shiv1/quals/lastz/test_data/pseudopig.fa",
+    "--output=/home/shiv1/quals/bench/results/smoke-v2/runs/static.pseudocat_vs_pseudopig__nogapped__1.lastz_out",
+    "--nogapped"
+  ],
+  "target": "/home/shiv1/quals/lastz/test_data/pseudocat.fa",
+  "query": "/home/shiv1/quals/lastz/test_data/pseudopig.fa",
+  "extra_args": [
+    "--nogapped"
+  ],
+  "exit_code": 0,
+  "timed_out": false,
+  "wall_s": 0.04,
+  "user_s": 0.01,
+  "sys_s": 0.02,
+  "cpu_pct": 95,
+  "max_rss_kb": 26356,
+  "page_faults_major": 0,
+  "page_faults_minor": 22391,
+  "ctxsw_voluntary": 1,
+  "ctxsw_involuntary": 5,
+  "output_bytes": 3122,
+  "stderr_tail": "",
+  "timestamp": "2026-05-06T14:42:55-0700",
+  "workload_meta": {
+    "kind": "static",
+    "target": "/home/shiv1/quals/lastz/test_data/pseudocat.fa",
+    "query": "/home/shiv1/quals/lastz/test_data/pseudopig.fa"
+  }
+}

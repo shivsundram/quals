@@ -1,0 +1,38 @@
+{
+  "workload": "static.reads_vs_pseudopig",
+  "variant": "default",
+  "rep": 1,
+  "cmd": [
+    "taskset",
+    "-c",
+    "0",
+    "/usr/bin/time",
+    "-v",
+    "/home/shiv1/quals/lastz/src/lastz",
+    "/home/shiv1/quals/lastz/test_data/pseudopig.fa[multiple]",
+    "/home/shiv1/quals/lastz/test_data/sample_101s.fa",
+    "--output=/home/shiv1/quals/bench/results/smoke-v2/runs/static.reads_vs_pseudopig__default__1.lastz_out"
+  ],
+  "target": "/home/shiv1/quals/lastz/test_data/pseudopig.fa",
+  "query": "/home/shiv1/quals/lastz/test_data/sample_101s.fa",
+  "extra_args": [],
+  "exit_code": 1,
+  "timed_out": false,
+  "wall_s": 0.0,
+  "user_s": 0.0,
+  "sys_s": 0.0,
+  "cpu_pct": 100,
+  "max_rss_kb": 3084,
+  "page_faults_major": 0,
+  "page_faults_minor": 266,
+  "ctxsw_voluntary": 1,
+  "ctxsw_involuntary": 0,
+  "output_bytes": 0,
+  "stderr_tail": "FAILURE: multiple action cannot be used with --lav\n(lav has requirements on the order of alignments that would require additional\n computation;  use \"--help=formats\" to see other options for output)\nCommand exited with non-zero status 1",
+  "timestamp": "2026-05-06T14:42:56-0700",
+  "workload_meta": {
+    "kind": "static",
+    "target": "/home/shiv1/quals/lastz/test_data/pseudopig.fa",
+    "query": "/home/shiv1/quals/lastz/test_data/sample_101s.fa"
+  }
+}
