@@ -598,27 +598,93 @@ From `bench/results/scaling-staged-v1/summary.csv`:
 | 1 Mbp × 1 Mbp | 2.50 | 158 | 0.695 | 1.698 | 28% |
 | 10 Mbp × 10 Mbp | 63.88 | 246 | **46.10** | 17.03 | **72%** |
 
-**Two findings worth flagging:**
+### Real chromosome-scale: two contrasting profiles
 
-1. **Crossover.** At small inputs (≤1 Mbp) `gapped_extension` dominates;
-   at 10 Mbp `seed_hit_search` overtakes and dominates (72%). This
-   matches SegAlign's headline claim: at chromosome scale, the
-   seed-and-filter stage is the bottleneck and the right thing to throw
-   on a GPU.
-2. **Super-linear scaling of seed_hit_search.** From 1 Mbp → 10 Mbp,
-   input area grows 100×, total wall grows 25×, but
-   `seed_hit_search` grows 66×. The likely cause is the diagonal-hash
-   data structure (re-hashing + rehashed-bucket walks scale super-linearly
-   with #seed-hits, which itself grows roughly with target_len ×
-   query_len for random sequence).
+Both runs use the `segalign_default` variant (lastz defaults +
+`--format=maf-`), single thread.
+
+**galGal6.chrZ × taeGut2.chrZ** — bird-vs-bird cross, 82 Mbp × 73 Mbp,
+real evolutionary divergence (~100 Mya). On g0002 (GPU node, pinned).
+From `bench/results/bird_z_cross-2026-05-06/.../__-1.stage.txt`:
+
+| Stage | Wall (s) | % of total |
+|---|---|---|
+| **Total** | **4366** (73 min) | 100% |
+| seed_hit_search | **3995** | **91.5%** |
+| gapped_extension | 363 | 8.3% |
+| I/O + index + output | 7 | 0.16% |
+
+**galGal6.chrZ × galGal6.chrZ** — same chromosome aligned to itself,
+82 Mbp × 82 Mbp. On sapling2 (head node, pinned). From
+`bench/results/bird_z_self-2026-05-06/.../__0.stage.txt`:
+
+| Stage | Wall (s) | % of total |
+|---|---|---|
+| **Total** | **14346** (239 min, ~4 h) | 100% |
+| seed_hit_search | 2532 | 17.6% |
+| **gapped_extension** | **11800** | **82.2%** |
+| I/O + index + output | 14 | 0.10% |
+| Output produced | **1.82 GB** of MAF | (vs 61 MB for cross) |
+
+In *both* runs, inside gapped_extension, `ydrop_one_sided_align` (the
+inner banded-SW DP loop) accounts for ~96% of the gapped time:
+349 s of 363 s (cross) and 5336 s of 11800 s (self).
+
+**The seed/gapped ratio inverts based on alignment shape.** Self-vs-self
+produces a giant trivial diagonal (the same chromosome aligning to
+itself perfectly along its full length) — that single alignment alone
+fills most of the gapped-extension budget and produces 30× more output
+bytes than the cross run. Cross-species at moderate divergence produces
+many more spurious seed hits that get ungapped-extended and rejected,
+filling the seed_hit_search budget.
+
+For the SegAlign comparison the **cross profile is the relevant one** —
+nobody benchmarks whole-genome self-self alignment. But the self
+profile is a useful reminder that "what's the bottleneck" depends
+strongly on alignment density, not just input size.
+
+### Findings worth flagging
+
+1. **Stage-dominance flips with alignment density.** Cross-species at
+   moderate divergence: seed_hit_search dominates (91.5% on bird Z
+   cross). Self-vs-self: gapped_extension dominates (82.2% on bird Z
+   self). Both are "chromosome scale" but they exercise different parts
+   of the algorithm. SegAlign's claim is calibrated on the cross
+   profile — that's the realistic whole-genome workload.
+2. **Crossover happens around 10 Mbp** (for cross-style inputs). At
+   small inputs (≤1 Mbp) `gapped_extension` dominates; at 10 Mbp
+   seed_hit_search overtakes (72%); at 80 Mbp real bird-cross it owns
+   91.5%. This matches SegAlign's headline claim: at chromosome scale,
+   the seed-and-filter stage is the right thing to throw on a GPU.
+3. **Super-linear scaling of seed_hit_search.** 1 Mbp → 10 Mbp: input
+   area grows 100×, total wall grows 25×, but seed_hit_search grows
+   66×. Likely cause is the diagonal-hash data structure (re-hashing +
+   rehashed-bucket walks scale super-linearly with seed-hit count,
+   itself ∝ target_len × query_len for random sequence).
+4. **Inner DP loop is 96% of gapped_extension** in both profiles
+   (cross: 349/363 s, self: 5336/11800 s). If we ever GPU-accelerate
+   gapped extension, `ydrop_one_sided_align` is the only target —
+   everything else is bookkeeping.
+5. **Real DNA is friendlier than random DNA.** 10 Mbp synthetic → 80
+   Mbp real bird-cross (60× the seed-search space): seed_hit_search grew
+   86×, gapped_extension grew 21×. Soft-masked repeats (~27% of
+   galGal6.chrZ) suppress seeding, and surviving HSP density is lower
+   in real DNA than in pseudo-random sequence near alignment threshold.
+6. **I/O is irrelevant at chr scale.** 7 s out of 73 min (cross),
+   14 s out of 239 min (self). No need to switch from FASTA slices to
+   direct .2bit reading.
 
 ### What we don't have yet
 
-- **Anything at chromosome scale.** The bird-vs-bird run was just
-  submitted (job 75052) at the time of writing — first chromosome-scale
-  data point landing soon.
+- **A 3-rep variance estimate at chr scale.** The first run hit the
+  2-hour SLURM time limit (warmup + measured rep needs ~150 min). The
+  sbatch wrapper now defaults to 6h; submit `bird_z_cross` again with
+  `WARMUP=0 REPS=3` for a clean variance estimate (~3.5 hours).
 - **Any GPU comparison.** SegAlign is not yet built / run on this
   cluster; that's a follow-up.
+- **N-shard CPU baseline.** Standard practice is to shard the target
+  by chromosome and run N parallel lastzes. We need that number to be
+  fair to LASTZ when later quoting GPU speedups.
 - **Hardware counter data.** `perf` is unavailable on this kernel
   (paranoid=3, missing linux-tools for 5.4.0-216). Plan: source-level
   instrumentation with `__rdtsc`-style counters, or move to a host
@@ -650,12 +716,12 @@ From `bench/results/scaling-staged-v1/summary.csv`:
 
 In rough order:
 
-1. **Land the chromosome-scale baseline.** Wait for job 75052
-   (`bird_z_cross`) to finish; check `seed_hit_search` share. If >50%,
-   it confirms the 10 Mbp synthetic finding scales up.
+1. **Re-run bird_z_cross with variance.** Submit again with
+   `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
+   median + min/max for the chr-scale wall and stage breakdown.
 2. **Run `bird_z_cross_breakdown`** (default + nogapped on the same
    pair) to back out gapped-extension cost on real data, the same way
-   we did for synthetic.
+   we did for synthetic. Should reproduce the 91/8 split.
 3. **Build + run SegAlign on the same chrZ pair** for a CPU-vs-GPU
    datapoint. Their docker image avoids the build complexity.
 4. **Add an N-shard CPU baseline** to bench.py — launch N parallel
@@ -680,7 +746,11 @@ A list of things that wasted time during setup so they don't waste
 time again:
 
 - **Don't run benchmarks on the head node.** Use `sbatch`. Even
-  single-thread numbers will be noisy under shared load.
+  single-thread numbers will be noisy under shared load. **And `pkill
+  -f lastz_T` doesn't reliably kill a Python harness wrapping lastz
+  via subprocess — it only kills the lastz child.** The Python parent
+  keeps running and respawns. Use `kill <pid>` on the actual python
+  PID, or `kill -9 -- -<pgid>` to nuke the whole process group.
 - **`lastz` is single-threaded.** Allocating lots of CPUs for one
   benchmark process is wasteful; `--cpus-per-task=2` is enough (one for
   lastz, one for harness overhead). We use 4 to give the OS scheduler

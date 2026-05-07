@@ -1,0 +1,67 @@
+{
+  "workload": "real.galGal6_chrZ_self",
+  "variant": "segalign_default",
+  "rep": 0,
+  "cmd": [
+    "taskset",
+    "-c",
+    "7",
+    "/usr/bin/time",
+    "-v",
+    "/home/shiv1/quals/lastz/src/lastz_T",
+    "/home/shiv1/quals/bench/data_genomes/galGal6.chrZ.fa",
+    "/home/shiv1/quals/bench/data_genomes/galGal6.chrZ.fa",
+    "--output=/home/shiv1/quals/bench/results/bird_z_self-2026-05-06/runs/real.galGal6_chrZ_self__segalign_default__0.lastz_out",
+    "--format=maf-"
+  ],
+  "target": "/home/shiv1/quals/bench/data_genomes/galGal6.chrZ.fa",
+  "query": "/home/shiv1/quals/bench/data_genomes/galGal6.chrZ.fa",
+  "extra_args": [
+    "--format=maf-"
+  ],
+  "exit_code": 0,
+  "timed_out": false,
+  "wall_s": 14345.0,
+  "user_s": 14338.12,
+  "sys_s": 2.71,
+  "cpu_pct": 99,
+  "max_rss_kb": 1298716,
+  "page_faults_major": 0,
+  "page_faults_minor": 367102,
+  "ctxsw_voluntary": 68,
+  "ctxsw_involuntary": 1244970,
+  "output_bytes": 1823476683,
+  "stderr_tail": "DNA words in table:        51963431\nungapped extensions:       6953751183\nHSPs:                      1161477\ngapped extensions:         903330",
+  "timestamp": "2026-05-06T15:56:52-0700",
+  "workload_meta": {
+    "kind": "real",
+    "target": "/home/shiv1/quals/bench/data_genomes/galGal6.chrZ.fa",
+    "query": "/home/shiv1/quals/bench/data_genomes/galGal6.chrZ.fa"
+  },
+  "stages": {
+    "total_run_time_s": 14345.657,
+    "sequence_1_io_s": 1.196,
+    "seed_position_table_s": 1.835,
+    "sequence_2_io_s": 1.119,
+    "seed_hit_search_s": 2531.851,
+    "chaining_s": 0.0,
+    "gapped_extension_s": 11799.575,
+    "interpolation_s": 0.0,
+    "output_s": 9.943,
+    "total_query_time_s": 14342.626,
+    "ge_above_below_s": 1654.997,
+    "ge_left_right_s": 3496.137,
+    "ge_ydrop_align_s": 5336.153,
+    "ge_ydrop_one_sided_align_s": 5335.788,
+    "ge_update_lr_bounds_s": 35.695,
+    "ge_next_sweep_seg_s": 0.628,
+    "ge_prev_sweep_seg_s": 0.68,
+    "ge_update_active_segs_s": 119.214,
+    "ge_filter_active_segs_s": 38.636
+  },
+  "stage_extras": {
+    "queries": "1",
+    "per query (with I/O)": "14342.626 (0.0 per second)",
+    "per query (w/o input)": "14341.507 (0.0 per second)"
+  }
+}
