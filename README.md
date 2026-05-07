@@ -845,6 +845,118 @@ nobody benchmarks whole-genome self-self alignment. But the self
 profile is a useful reminder that "what's the bottleneck" depends
 strongly on alignment density, not just input size.
 
+### Inside seed_hit_search: the bird-Z 10 Mbp eu-stack profile
+
+The chr-scale stage report tells us `seed_hit_search` is 91.5% of wall
+time on bird-Z cross — but not which **part** of `seed_hit_search`. To
+break that out, we ran `bench/profile_eustack.py` on the 10 Mbp slice
+(`real.galGal6_vs_taeGut2_chrZ_10mb`, ~56 s wall, 3139 samples at
+100 Hz). Output in `bench/results/eustack-bird10mb-001/`.
+
+**Top exclusive frames (where the IP literally was at sample time):**
+
+| Function | Exclusive % | What it does |
+|---|---:|---|
+| `xdrop_extend_seed_hit` | **48.6 %** | ungapped x-drop extension from a seed hit |
+| `find_table_matches` | **34.7 %** | chain walk through `pt->prev[]` for one query word |
+| `ydrop_one_sided_align` | 11.0 % | gapped-extension inner DP loop |
+| `process_for_simple_hit` | 3.9 % | diagonal-dedup gatekeeper that calls x-drop |
+| everything else | 1.8 % | seeding, I/O, parsing, stage-timer overhead |
+
+**Inclusive call tree** (the same data viewed as cumulative time per
+call subtree — what the flamegraph shows). Inclusive % includes the
+function itself plus everything it calls; exclusive % is just the body:
+
+```
+seed_hit_search loop body                    (~0 % exclusive — all in callees)
+└─ for each surviving seed position in target chain:                 ←─ 87 % inclusive
+     │                                                                   here
+     ├─ chain walk: load pt->prev[s-1]      ────┐
+     │   advance s, load DNA, check word      ├── 35 % EXCL
+     │   = find_table_matches body            └─  in find_table_matches
+     │
+     └─ process_for_simple_hit callback        ←── 52 % inclusive
+          ├─ diagonal dedup check                  4 % EXCL
+          │   diagEnd[h] = compare endpoints       in process_for_simple_hit
+          │
+          └─ xdrop_extend_seed_hit              ←── 49 % EXCL = leaf
+              ├─ left  extension scoring loop
+              ├─ right extension scoring loop
+              └─ update diagEnd[h] for next time
+```
+
+Read the flamegraph as: every box's width = **inclusive** time. The
+strip of a parent box that has nothing stacked on top of it = its
+**exclusive** time. So the bottom red bar (`find_table_matches`) at
+~87 % width has a ~52 %-wide `process_for_simple_hit` stacked on it,
+leaving a ~35 % strip with no children — that strip is the chain walk
+loop body itself.
+
+**What's in the 35 % "exclusive find_table_matches"?** That's the
+inner loop body at `lastz/src/seed_search.c:832-872`:
+
+```
+for (pos = pt->last[packed2]; pos != noPreviousPos; pos = pt->prev[pos]) {
+    pos1 = adjStart + step*pos;          // arithmetic — cheap
+    if ((selfCompare) && ...) continue;  // false on cross-species, ~free
+    if ((sameStrand)  && ...) continue;  // bandWidth==0 default, short-circuits
+    seed_search_count_stat(rawSeedHits); // no-op when stats off
+    basesHit += (*processor)(...);       // → process_for_simple_hit
+}
+```
+
+The 35 % is dominated by **one thing**: the pointer-chase load
+`pos = pt->prev[pos]`. Each iteration's address depends on the
+previous iteration's load result, so the CPU can't speculate ahead and
+can't usefully prefetch — `pt->prev[]` is a flat `u32` array indexed
+by an essentially-random target position (whatever happened to hash
+to the same packed seed word as our query word). On real DNA with
+soft-masked repeats, those chains can be long (a popular 12-mer can
+appear thousands of times across a chromosome), and walking each one
+is a serial L2/L3 latency ladder.
+
+Secondary contributors inside the 35 %:
+- **Indirect call dispatch** through `*processor` — GCC can't inline
+  `process_for_simple_hit` because the call goes through a function
+  pointer (`hp->hitProc`) set up at workload type dispatch time. So we
+  pay a `call/ret` per seed hit even when dedup short-circuits.
+- **A multiply + add** for the position translation
+  (`pos1 = adjStart + step*pos`).
+- **Loop overhead** (compare against `noPreviousPos`, branch).
+
+We don't have a finer cycle breakdown yet — that's the rdtsc-substages
+patch's job (next pending todo). The expected outcome is that
+~70-90 % of the 35 % is the `pt->prev[]` load latency, with the rest
+in indirect-call dispatch and arithmetic. If true, **the chain walk
+is memory-latency-bound** and the right GPU port pattern is what
+SegAlign does: flatten the `pt->last`/`pt->prev` linked list into a
+dense per-bucket array so the chain walk becomes a contiguous stream
+load, friendly to wide vector loads + bandwidth.
+
+**Findings from the eu-stack profile that the stage report missed:**
+
+1. The dominant single function is `xdrop_extend_seed_hit` at 48.6 %,
+   not `find_table_matches`. Roughly half the entire program at chr
+   scale is the ungapped x-drop scoring loop — exactly the kernel
+   SegAlign accelerates first on the GPU.
+2. The seed-lookup-vs-ungapped-extend ratio inverts between scales:
+   1 Mbp synth = 1.97 : 1 (lookup-heavy), 10 Mbp real = 0.71 : 1
+   (extend-heavy). At chr scale, more seed hits **survive** the dedup
+   filter and reach the x-drop call.
+3. Diagonal dedup is **invisible** in the profile (the dedup check
+   itself is hidden inside the 4 % exclusive `process_for_simple_hit`
+   strip). That's a feature, not a bug — it means the cache-line
+   `diagEnd[h]` lookup is essentially free, and it's filtering enough
+   redundant extensions that the savings dwarf its own cost.
+4. Stage-timer overhead is amortized away at chr scale: 3.8 % at 1 Mbp
+   synth → 0.1 % at 10 Mbp real. The instrumented `lastz_T` binary is
+   safe to use as the production profiling target — no need to also
+   re-run with `--no-stage-timers`.
+5. Only **14 distinct call stacks** across 3139 samples. lastz spends
+   essentially all of its time on a handful of code paths, which is
+   excellent news for porting: cover 2-3 functions and you've covered
+   ~90 % of the runtime.
+
 ### Findings worth flagging
 
 1. **Stage-dominance flips with alignment density.** Cross-species at
@@ -893,12 +1005,11 @@ strongly on alignment density, not just input size.
   2-hour SLURM time limit (warmup + measured rep needs ~150 min). The
   sbatch wrapper now defaults to 6h; submit `bird_z_cross` again with
   `WARMUP=0 REPS=3` for a clean variance estimate (~3.5 hours).
-- **eu-stack profile of real DNA at 10 Mbp.** Synthetic 1 Mbp profile
-  is captured (above). The 10 Mbp bird-Z cross slice is registered as
-  `real.galGal6_vs_taeGut2_chrZ_10mb` and the sbatch wrapper exists;
-  one job submission produces ~6-9k samples and tells us how the
-  substep mix shifts on real DNA at the size where seed_hit_search
-  starts to dominate.
+- **eu-stack profile of real DNA at 10 Mbp.** ✓ Done — see "Inside
+  seed_hit_search" subsection above. The synthetic 1 Mbp baseline is
+  also captured at `bench/results/eustack-smoke/`. Cross-validation
+  via rdtsc instrumentation is the next instrumentation step (see #2
+  in the open questions list).
 - **Any GPU comparison.** SegAlign is not yet built / run on this
   cluster; that's a follow-up.
 - **N-shard CPU baseline.** Standard practice is to shard the target
@@ -938,19 +1049,16 @@ strongly on alignment density, not just input size.
 
 In rough order:
 
-1. **Run eu-stack on the bird-Z 10 Mbp slice.** The `bird_z_cross_10mb`
-   workload + `bench/sbatch/profile_eustack.sbatch` wrapper are ready;
-   one submission tells us whether real-DNA, cross-species,
-   chr-near-scale workload re-shapes the substep mix vs. the synthetic
-   1 Mbp baseline (where gapped extension still dominates). Expect
-   `find_table_matches` and `xdrop_extend_seed_hit` to grow share;
-   `ydrop_one_sided_align` to shrink share.
-2. **Add `__rdtsc` accumulators to seed_hit_search substages.** Patch
+1. **Add `__rdtsc` accumulators to seed_hit_search substages.** Patch
    `lastz/src/seed_search.c` on a new `stage-timing+rdtsc-substages`
    branch with cycle-accurate timers around (a) the chain walk
    (`pt->last[word]` → `pt->prev[]`), (b) the diagonal-dedup hash
-   check, (c) `xdrop_extend_seed_hit`, (d) HSP emit. Cross-check
-   against the eu-stack histogram on the same workload.
+   check, (c) `xdrop_extend_seed_hit` left/right halves, (d) HSP emit.
+   The eu-stack profile gives us function-level shares; rdtsc tells us
+   how those shares decompose into memory-latency vs. ALU work
+   *inside* each function. Critical for deciding whether the GPU port
+   should optimize for bandwidth (memory-bound chain walk) or
+   throughput (compute-bound x-drop scoring).
 3. **Re-run bird_z_cross with variance.** Submit again with
    `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
    median + min/max for the chr-scale wall and stage breakdown.

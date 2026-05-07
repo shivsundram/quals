@@ -1,0 +1,19 @@
+{
+  "lastz": "lastz/src/lastz_T",
+  "target": "bench/data_genomes/galGal6.chrZ_0_10mb.fa",
+  "query": "bench/data_genomes/taeGut2.chrZ_0_10mb.fa",
+  "extra_args": [
+    "--format=maf-"
+  ],
+  "rate_hz": 100.0,
+  "interval_ms": 10.0,
+  "max_samples": null,
+  "started_at": "2026-05-07T14:49:33",
+  "wall_s": 56.09761166572571,
+  "lastz_exit": 0,
+  "samples_attempted": 3140,
+  "samples_with_stack": 3139,
+  "samples_failed": 1,
+  "unique_stacks": 14,
+  "load_base_hex": "0x55d7f4d2a000"
+}
