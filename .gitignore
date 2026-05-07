@@ -36,6 +36,14 @@ bench/results/**/*.axt
 bench/results/**/*.lav
 bench/results/**/*.sam
 
+# eu-stack profile dumps. We KEEP folded.txt / top_funcs.txt / top_lines.txt /
+# manifest.json (small, useful research history). We DROP per-sample raw stacks
+# (hundreds of small files, ASLR-randomized PIE addresses make them
+# host-specific anyway) and the alignment output of the profiled run.
+bench/results/**/raw/
+bench/results/**/lastz.out
+bench/results/**/lastz.err
+
 # -----------------------------------------------------------------------------
 # SLURM artifacts.
 # -----------------------------------------------------------------------------

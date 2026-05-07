@@ -1,0 +1,16 @@
+# total samples: 312  (eu-stack failures: 1)
+   count    pct  function
+     180  57.7%  ydrop_one_sided_align.part.0
+      57  18.3%  find_table_matches
+      29   9.3%  xdrop_extend_seed_hit
+      12   3.8%  __vdso_gettimeofday
+      11   3.5%  gapped_extend
+       7   2.2%  process_for_simple_hit
+       6   1.9%  add_word
+       4   1.3%  microsec_clock
+       1   0.3%  parse_fasta
+       1   0.3%  _IO_getc
+       1   0.3%  seed_hit_search
+       1   0.3%  __memmove_avx_unaligned_erms
+       1   0.3%  write
+       1   0.3%  print_maf_align

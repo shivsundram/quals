@@ -170,6 +170,21 @@ _register(Workload(
 ))
 
 _register(Workload(
+    id="real.galGal6_vs_taeGut2_chrZ_10mb",
+    description=("First 10 Mbp of chicken chrZ vs first 10 Mbp of zebra "
+                 "finch chrZ. Iteration-friendly subset of the bird-Z "
+                 "cross workload (~1 min wall) for profiler development. "
+                 "Same shape as the full chrZ pair: real DNA, real "
+                 "soft-masking, real cross-species divergence — just "
+                 "1/(8 x 7) of the seed-search space."),
+    resolve=_real(
+        target_path=DATA_GENOMES / "galGal6.chrZ_0_10mb.fa",
+        query_path=DATA_GENOMES / "taeGut2.chrZ_0_10mb.fa",
+    ),
+    tags=("real", "genome", "subset", "cross", "bird", "profile"),
+))
+
+_register(Workload(
     id="real.hg38_vs_mm10",
     description=("Human (hg38) chr19 vs Mouse (mm10) chr10, ~58 Mbp x ~130 Mbp. "
                  "Mostly-syntenic mammal pair, ~90 Mya divergence. Heavier than "
@@ -317,5 +332,11 @@ SUITES: dict[str, list[tuple[str, str]]] = {
     "bird_z_cross_breakdown": [
         ("real.galGal6_vs_taeGut2_chrZ", "default"),
         ("real.galGal6_vs_taeGut2_chrZ", "nogapped"),
+    ],
+    # Iteration-friendly subset (10 Mbp x 10 Mbp). For profiler development,
+    # eu-stack sampling, and rdtsc substage breakdown — fast enough to iterate
+    # but the same shape as the full chr workload.
+    "bird_z_cross_10mb": [
+        ("real.galGal6_vs_taeGut2_chrZ_10mb", "segalign_default"),
     ],
 }

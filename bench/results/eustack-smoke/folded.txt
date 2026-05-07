@@ -1,0 +1,14 @@
+_start;__libc_start_main;main;finish_one_strand;gapped_extend;ydrop_align;ydrop_one_sided_align.part.0 180
+_start;__libc_start_main;main;start_one_strand;seed_hit_search;find_table_matches 57
+_start;__libc_start_main;main;start_one_strand;seed_hit_search;find_table_matches;process_for_simple_hit;xdrop_extend_seed_hit 29
+_start;__libc_start_main;main;finish_one_strand;gapped_extend;ydrop_align;ydrop_one_sided_align.part.0;microsec_clock;__vdso_gettimeofday 12
+_start;__libc_start_main;main;finish_one_strand;gapped_extend 11
+_start;__libc_start_main;main;start_one_strand;seed_hit_search;find_table_matches;process_for_simple_hit 7
+_start;__libc_start_main;main;build_seed_position_table;add_word 6
+_start;__libc_start_main;main;finish_one_strand;gapped_extend;ydrop_align;ydrop_one_sided_align.part.0;microsec_clock 4
+_start;__libc_start_main;main;load_sequence.part.0;load_sequence_core;load_fasta_sequence;parse_fasta 1
+_start;__libc_start_main;main;load_sequence.part.0;load_sequence_core;load_fasta_sequence;parse_fasta;getc_or_die;_IO_getc 1
+_start;__libc_start_main;main;start_one_strand;seed_hit_search 1
+_start;__libc_start_main;main;finish_one_strand;gapped_extend;qsort_r;msort_with_tmp.part.0;msort_with_tmp.part.0;msort_with_tmp.part.0;msort_with_tmp.part.0;msort_with_tmp.part.0;msort_with_tmp.part.0;__memmove_avx_unaligned_erms 1
+_start;__libc_start_main;main;finish_one_strand;gapped_extend;ydrop_align;ydrop_one_sided_align.part.0;__fprintf_chk;__vfprintf_internal;buffered_vfprintf;_IO_file_xsputn@@GLIBC_2.2.5;_IO_file_write@@GLIBC_2.2.5;write 1
+_start;__libc_start_main;main;finish_one_strand;print_align_list;print_maf_align_list;print_maf_align 1

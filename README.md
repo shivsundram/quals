@@ -23,13 +23,15 @@ comes from, how to run benchmarks, and what we already know.
    - [5.1 Synthetic FASTAs (`gen_data.py`)](#51-synthetic-fastas-gen_datapy)
    - [5.2 Real mRNAs from NCBI (`fetch_real_data.py`)](#52-real-mrnas-from-ncbi-fetch_real_datapy)
    - [5.3 Reference genomes from UCSC (`fetch_genomes.py` + `twobit.py`)](#53-reference-genomes-from-ucsc-fetch_genomespy--twobitpy)
+   - [5.4 Sub-chromosome slices (`slice_genome.py`)](#54-sub-chromosome-slices-slice_genomepy)
 6. [Workload registry (`workloads.py`)](#6-workload-registry-workloadspy)
 7. [Benchmark harness (`bench.py`)](#7-benchmark-harness-benchpy)
 8. [Stage-timing instrumentation](#8-stage-timing-instrumentation)
-9. [Running on SLURM](#9-running-on-slurm)
-10. [What we know so far](#10-what-we-know-so-far)
-11. [Open questions / next steps](#11-open-questions--next-steps)
-12. [Gotchas, lessons learned, and "don't do that"](#12-gotchas-lessons-learned-and-dont-do-that)
+9. [eu-stack PC sampling profiler (`profile_eustack.py`)](#9-eu-stack-pc-sampling-profiler-profile_eustackpy)
+10. [Running on SLURM](#10-running-on-slurm)
+11. [What we know so far](#11-what-we-know-so-far)
+12. [Open questions / next steps](#12-open-questions--next-steps)
+13. [Gotchas, lessons learned, and "don't do that"](#13-gotchas-lessons-learned-and-dont-do-that)
 
 ---
 
@@ -46,6 +48,8 @@ should work; the things that actually matter:
 | `make` | builds lastz | `make --version` |
 | `/usr/bin/time` (GNU, not the bash builtin) | bench harness reads `time -v` output | `/usr/bin/time --version` |
 | `taskset` | CPU pinning | `taskset --version` |
+| `eu-stack` (from `elfutils`) | sampling profiler (§9) | `eu-stack --version` — `apt install elfutils` |
+| `addr2line` (from binutils) | resolves PIE addrs to file:line for the profiler | `addr2line --version` |
 | `curl` or `wget` | UCSC + NCBI downloads | already on most boxes |
 | Network egress to `eutils.ncbi.nlm.nih.gov` and `hgdownload.soe.ucsc.edu` | fetching data | `curl -I https://hgdownload.soe.ucsc.edu` |
 | Scratch directory at `/scratch2/shiv1/lastz-bench-data/` (or change the path) | genomes are several GB; don't put them under `$HOME` | `mkdir -p /scratch2/shiv1/lastz-bench-data` |
@@ -77,14 +81,18 @@ quals/
     ├── workloads.py                   # workload + variant + suite registry
     ├── gen_data.py                    # synthetic FASTA generator
     ├── fetch_real_data.py             # NCBI mRNA fetcher
-    ├── fetch_genomes.py               # UCSC 2bit fetcher + chromosome slicer
+    ├── fetch_genomes.py               # UCSC 2bit fetcher + per-chromosome FASTA extractor
     ├── twobit.py                      # in-tree .2bit reader (replaces UCSC twoBitToFa)
+    ├── slice_genome.py                # sub-chromosome FASTA slicer (e.g. first 10 Mbp of chrZ)
+    ├── profile_eustack.py             # eu-stack PC sampler — gives function- + file:line-level
+    │                                  #   call-stack histograms for a single lastz run
     ├── data/                          # synthetic FASTAs (auto-created)
     ├── data_real/                     # NCBI fetches (auto-created)
-    ├── data_genomes/                  # symlinks → /scratch2/.../2bit and slices
+    ├── data_genomes/                  # symlinks → /scratch2/.../2bit, slices, sub-slices
     ├── results/<run-name>/            # per-run output directory
     └── sbatch/
         ├── run_bench.sbatch           # SLURM wrapper — submits a suite to the gpu partition
+        ├── profile_eustack.sbatch     # SLURM wrapper — submits one eu-stack profiling run
         └── logs/                      # sbatch stdout/stderr per job
 ```
 
@@ -329,6 +337,39 @@ python3 bench/twobit.py /scratch2/.../2bit/hg38.2bit list
 python3 bench/twobit.py /scratch2/.../2bit/hg38.2bit fetch chr22 > chr22.fa
 ```
 
+### 5.4 Sub-chromosome slices (`slice_genome.py`)
+
+For profiler iteration we want runs that finish in tens of seconds, not
+73 minutes. `slice_genome.py` cuts a contiguous range out of an existing
+single-sequence FASTA (typically one of the per-chromosome files produced
+by `fetch_genomes.py`), preserving N-blocks and soft-masking, and renames
+the FASTA header so lastz sees a unique sequence id.
+
+```bash
+# First 10 Mbp of galGal6.chrZ
+python3 bench/slice_genome.py \
+    bench/data_genomes/galGal6.chrZ.fa \
+    bench/data_genomes/galGal6.chrZ_0_10mb.fa \
+    --start 0 --length 10_000_000 \
+    --rename "galGal6.chrZ:0-10mb"
+
+# First 10 Mbp of taeGut2.chrZ
+python3 bench/slice_genome.py \
+    bench/data_genomes/taeGut2.chrZ.fa \
+    bench/data_genomes/taeGut2.chrZ_0_10mb.fa \
+    --start 0 --length 10_000_000 \
+    --rename "taeGut2.chrZ:0-10mb"
+```
+
+The script prints a small stats block (ACGT / acgt / N counts) so you can
+sanity-check the masking density of your slice — e.g. `galGal6.chrZ:0-10mb`
+is 21.0% lowercase (vs 27% for the whole chrZ — the 5' tip is unusually
+clean) and `taeGut2.chrZ:0-10mb` is only 11.7% lowercase. Worth knowing
+when comparing slices to whole-chr numbers.
+
+These slices live under `/scratch2/shiv1/lastz-bench-data/slices/` and are
+symlinked into `bench/data_genomes/` exactly like the full-chr files.
+
 ---
 
 ## 6. Workload registry (`workloads.py`)
@@ -354,6 +395,7 @@ real.actb_<sp1>_vs_<sp2>               9-cell mRNA matrix (~1.8 kbp each)
 
 real.galGal6_chrZ_self                 ~82 Mbp self-vs-self
 real.galGal6_vs_taeGut2_chrZ           ~82 × ~73 Mbp bird-vs-bird   ← headline real workload
+real.galGal6_vs_taeGut2_chrZ_10mb      first 10 Mbp of each chrZ    ← profiler iteration target
 real.hg38_vs_mm10                      ~58 × ~130 Mbp mammal pair (heavier; longer)
 
 synth.uniform_{10,100,1000,10000}kb    scaling sweep, 10 kbp → 10 Mbp
@@ -387,6 +429,7 @@ bird_z_self                 galGal6.chrZ self-vs-self, segalign_default
 bird_z_self_breakdown       same workload, default + nogapped
 bird_z_cross                galGal6.chrZ vs taeGut2.chrZ, segalign_default  ← key real run
 bird_z_cross_breakdown      same workload, default + nogapped
+bird_z_cross_10mb           first 10 Mbp of each chrZ, segalign_default     ← profiler iteration
 ```
 
 ### Adding a workload
@@ -520,12 +563,164 @@ populate the `*_s_median` columns in `summary.csv`.
 changes). `make test` produces byte-identical output between `lastz`
 and `lastz_T` on the bundled smoke test.
 
-**Overhead:** sub-millisecond on real workloads. To verify, run the
-same suite with `--no-stage-timers` and compare wall medians.
+**Overhead:** sub-millisecond on real workloads in aggregate. The eu-stack
+profile (§9) shows ~3-4% of wall time inside `__vdso_gettimeofday`, so
+the timers themselves are visible but not dominant. For absolute
+wall-time numbers, sanity-check with `--no-stage-timers` (uses the
+non-instrumented `lastz` binary).
+
+`lastz_T` is **also built with `-g`** (DWARF debug info) so eu-stack and
+addr2line can resolve hot addresses to file:line. `-g` is free at `-O3`
+— it only adds `.debug_*` ELF sections, which the loader doesn't touch
+and which don't affect `.text` size or branch layout.
 
 ---
 
-## 9. Running on SLURM
+## 9. eu-stack PC sampling profiler (`profile_eustack.py`)
+
+We can't use `perf` on this cluster (kernel 5.4 +
+`kernel.perf_event_paranoid=3`, no `linux-tools` package). The next
+best thing is **`eu-stack` from elfutils**: a stack walker that, when
+called repeatedly, becomes a poor-man's sampling profiler. Combined
+with `addr2line` against `lastz_T` (built with `-g`), we get function-
+**and** file:line-level breakdown of where the program counter is
+spending its time.
+
+`bench/profile_eustack.py` wraps the whole thing:
+
+1. Forks `lastz_T` as a child (so we own its ptrace permission under
+   Ubuntu's default `ptrace_scope=1`) and has the child call
+   `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` via `preexec_fn`, so
+   sibling processes (the `eu-stack` invocations) can attach.
+2. Captures the PIE load base from `/proc/<pid>/maps` while the target
+   is alive.
+3. Loops `eu-stack -p <pid>` at the requested rate, saving each raw
+   sample.
+4. After the target exits, runs `addr2line` on every unique leaf PC
+   (with the load-base subtracted, since the binary is PIE), and
+   aggregates into:
+   - `folded.txt` — Brendan-Gregg-style stack folding
+     (`outer;...;inner <count>`), ready to feed to `flamegraph.pl`.
+   - `top_funcs.txt` — flat function-level histogram.
+   - `top_lines.txt` — leaf function + file:line + count, line-resolved
+     where DWARF info exists, falling back to hex address otherwise.
+   - `manifest.json` — what we ran, when, sample count, load base.
+
+### CLI
+
+```bash
+python3 bench/profile_eustack.py \
+    --lastz   lastz/src/lastz_T \
+    --target  bench/data_genomes/galGal6.chrZ_0_10mb.fa \
+    --query   bench/data_genomes/taeGut2.chrZ_0_10mb.fa \
+    --out-dir bench/results/eustack-bird10mb-001 \
+    --rate-hz 100 \
+    --extra-arg=--format=maf-
+```
+
+Notes:
+
+- Use `--extra-arg=<value>` (with `=`) for any lastz arg that starts
+  with `--`. argparse won't accept it as a separate token.
+- `--rate-hz 100` (default) gives ~5 ms between samples, which is well
+  below the per-sample eu-stack cost (~1-3 ms on this host). At higher
+  rates the sampler can't keep up and effective rate drops.
+- `--max-samples N` caps the number of samples (useful for very long
+  runs where you don't want hundreds of MB of raw stacks).
+- Default keeps `raw/sample-NNNNNN.txt` for re-aggregation; use
+  `--no-keep-raw` to discard them after folding.
+
+### Sizing
+
+| Workload | Wall (s) | Samples @ 100 Hz | Stat resolution |
+|---|---|---|---|
+| synthetic 1 Mbp × 1 Mbp | ~3 | ~300 | OK for top-3 functions |
+| 10 Mbp × 10 Mbp slice | ~60-90 | ~6000-9000 | Good (1% resolution) |
+| Full bird-Z chr-cross | ~73 min | ~440k @ 100 Hz | Overkill — use lower rate or `--max-samples` |
+
+### Smoke result (synthetic 1 Mbp × 1 Mbp, default lastz, 312 samples)
+
+```
+ydrop_one_sided_align.part.0          57.7%   (gapped extension inner DP loop)
+find_table_matches                    18.3%   (seed lookup; hot at seeds.c:1306)
+xdrop_extend_seed_hit                  9.3%   (ungapped extension after a seed hit)
+__vdso_gettimeofday                    3.8%   (stage-timer overhead — see §8)
+gapped_extend                          3.5%
+process_for_simple_hit                 2.2%
+add_word                               1.9%   (seed table build)
+```
+
+Use this as the synthetic-DNA baseline; the bird-Z 10 Mbp profile is
+the real-DNA equivalent and is the next thing to capture (see §12).
+
+### Submitting a profile run via SLURM
+
+For anything beyond a few seconds of wall time, run on a compute node:
+
+```bash
+sbatch --export=ALL,\
+    TARGET=bench/data_genomes/galGal6.chrZ_0_10mb.fa,\
+    QUERY=bench/data_genomes/taeGut2.chrZ_0_10mb.fa,\
+    OUT_DIR=bench/results/eustack-bird10mb-001 \
+    bench/sbatch/profile_eustack.sbatch
+```
+
+The wrapper accepts `RATE_HZ`, `EXTRA_ARG`, `LASTZ`, `PIN_CPU` overrides
+(see comments in `bench/sbatch/profile_eustack.sbatch`). It pins both
+the python sampler and the lastz child to a single CPU via `taskset`,
+just like the bench harness wrapper.
+
+### Visualizing the results
+
+```bash
+# Quick text summary
+cat bench/results/eustack-bird10mb-001/top_funcs.txt | head -15
+cat bench/results/eustack-bird10mb-001/top_lines.txt | head -25
+head -10 bench/results/eustack-bird10mb-001/folded.txt
+
+# Flamegraph (if you have Brendan Gregg's flamegraph.pl in PATH)
+flamegraph.pl < bench/results/eustack-bird10mb-001/folded.txt > flame.svg
+
+# Re-aggregate from raw stacks (e.g. to filter out specific frames):
+python3 -c '
+import sys, collections
+counts = collections.Counter()
+for path in sys.argv[1:]:
+    with open(path) as f:
+        frames = [line.split()[2] for line in f if line.lstrip().startswith("#")]
+    if frames:
+        counts[";".join(reversed(frames))] += 1
+for k, v in counts.most_common():
+    print(v, k)
+' bench/results/eustack-bird10mb-001/raw/sample-*.txt
+```
+
+### Known limitations
+
+- **No GPU profiling** — eu-stack is CPU-only.
+- **PIE addresses are randomized per run.** We capture the load base
+  from `/proc/<pid>/maps` while the target is alive and use it for
+  addr2line; if `/proc/<pid>/maps` can't be read in time (very short
+  runs, <50 ms), line resolution silently falls back to hex addresses.
+- **Inlined functions get attributed to their callsite, not their
+  definition.** GCC at `-O3` partial-inlines `ydrop_one_sided_align`
+  into multiple seed_search.c callsites, so the "file:line" for
+  `ydrop_one_sided_align.part.0` shows up as `seed_search.c:399`
+  (the call site) rather than `gapped_extend.c:NNN`. eu-stack `-i`
+  (show inlined frames) helps but isn't perfect; we don't enable it by
+  default to keep the folded output simpler.
+- **Effective sample rate ≤ requested rate.** eu-stack costs 1-3 ms
+  per call (process spawn + ptrace attach + walk + detach). At 200 Hz
+  requested we typically see 75-100 Hz effective. Bump SLURM cpus if
+  you want sustained 200+ Hz.
+- **ptrace_scope=1 is fine; ptrace_scope=2 or 3 is not.** If you ever
+  see `dwfl_thread_getframes: Operation not permitted` after our
+  PR_SET_PTRACER opt-in, the host has been locked down further; ask
+  the sysadmin to lower `kernel.yama.ptrace_scope`.
+
+---
+
+## 10. Running on SLURM
 
 **Don't run anything serious on the head node.** Even though lastz is
 single-threaded, head-node CPU is shared with other users; numbers will
@@ -564,9 +759,16 @@ sbatch --export=ALL,SUITE=bird_z_cross_breakdown,REPS=1,RUN_NAME=bird_z_cross_br
 # Mammal pair (much heavier; bump time limit).
 sbatch --time=06:00:00 --export=ALL,SUITE=,REPS=1,RUN_NAME=hg38_mm10-2026-05-06 \
        bench/sbatch/run_bench.sbatch   # add a suite for hg38_vs_mm10 first
+
+# eu-stack profile of the bird-Z 10 Mbp slice.
+sbatch --export=ALL,\
+    TARGET=bench/data_genomes/galGal6.chrZ_0_10mb.fa,\
+    QUERY=bench/data_genomes/taeGut2.chrZ_0_10mb.fa,\
+    OUT_DIR=bench/results/eustack-bird10mb-001 \
+    bench/sbatch/profile_eustack.sbatch
 ```
 
-The wrapper:
+The bench wrapper (`run_bench.sbatch`):
 - Pins to the **first** CPU SLURM has actually given us
   (cgroup-aware — uses `taskset -pc $$` to discover allocated cpus,
   then takes the first one). You can override with `PIN_CPU=` in
@@ -585,7 +787,7 @@ scancel <jobid>                                                       # kill it
 
 ---
 
-## 10. What we know so far
+## 11. What we know so far
 
 ### Single-thread synthetic scaling (3-rep medians, default lastz)
 
@@ -673,6 +875,17 @@ strongly on alignment density, not just input size.
 6. **I/O is irrelevant at chr scale.** 7 s out of 73 min (cross),
    14 s out of 239 min (self). No need to switch from FASTA slices to
    direct .2bit reading.
+7. **First eu-stack profile (synthetic 1 Mbp × 1 Mbp).** From
+   `bench/results/eustack-smoke/`, default lastz, 312 samples in 4.1 s:
+   `ydrop_one_sided_align` 57.7%, `find_table_matches` 18.3%,
+   `xdrop_extend_seed_hit` 9.3%, `__vdso_gettimeofday` 3.8% (the
+   stage-timer overhead is real but small), `add_word` 1.9% (seed table
+   build). At 1 Mbp synthetic the gapped extension share is what
+   dominates — consistent with the synthetic scaling table above
+   (seed_hit_search doesn't take over until ~10 Mbp+). The hottest
+   single source line in the seed lookup is `seeds.c:1306` (10.9% of
+   all samples) — that's the chain walk inside `find_table_matches`
+   (the `for (s = pt->last[word]; s != NULL; s = pt->prev[s-1])` loop).
 
 ### What we don't have yet
 
@@ -680,6 +893,12 @@ strongly on alignment density, not just input size.
   2-hour SLURM time limit (warmup + measured rep needs ~150 min). The
   sbatch wrapper now defaults to 6h; submit `bird_z_cross` again with
   `WARMUP=0 REPS=3` for a clean variance estimate (~3.5 hours).
+- **eu-stack profile of real DNA at 10 Mbp.** Synthetic 1 Mbp profile
+  is captured (above). The 10 Mbp bird-Z cross slice is registered as
+  `real.galGal6_vs_taeGut2_chrZ_10mb` and the sbatch wrapper exists;
+  one job submission produces ~6-9k samples and tells us how the
+  substep mix shifts on real DNA at the size where seed_hit_search
+  starts to dominate.
 - **Any GPU comparison.** SegAlign is not yet built / run on this
   cluster; that's a follow-up.
 - **N-shard CPU baseline.** Standard practice is to shard the target
@@ -687,8 +906,11 @@ strongly on alignment density, not just input size.
   fair to LASTZ when later quoting GPU speedups.
 - **Hardware counter data.** `perf` is unavailable on this kernel
   (paranoid=3, missing linux-tools for 5.4.0-216). Plan: source-level
-  instrumentation with `__rdtsc`-style counters, or move to a host
-  where we can run `perf stat`.
+  instrumentation with `__rdtsc`-style counters around the
+  `seed_hit_search` substages (chain walk vs. diag-dedup vs. ungapped
+  extend vs. HSP emit), captured per-batch to keep overhead under 1%.
+  This goes on a `stage-timing+rdtsc-substages` branch of the lastz
+  fork, alongside the eu-stack data as a cross-check.
 
 ### Confirmed facts about LASTZ itself
 
@@ -712,35 +934,47 @@ strongly on alignment density, not just input size.
 
 ---
 
-## 11. Open questions / next steps
+## 12. Open questions / next steps
 
 In rough order:
 
-1. **Re-run bird_z_cross with variance.** Submit again with
+1. **Run eu-stack on the bird-Z 10 Mbp slice.** The `bird_z_cross_10mb`
+   workload + `bench/sbatch/profile_eustack.sbatch` wrapper are ready;
+   one submission tells us whether real-DNA, cross-species,
+   chr-near-scale workload re-shapes the substep mix vs. the synthetic
+   1 Mbp baseline (where gapped extension still dominates). Expect
+   `find_table_matches` and `xdrop_extend_seed_hit` to grow share;
+   `ydrop_one_sided_align` to shrink share.
+2. **Add `__rdtsc` accumulators to seed_hit_search substages.** Patch
+   `lastz/src/seed_search.c` on a new `stage-timing+rdtsc-substages`
+   branch with cycle-accurate timers around (a) the chain walk
+   (`pt->last[word]` → `pt->prev[]`), (b) the diagonal-dedup hash
+   check, (c) `xdrop_extend_seed_hit`, (d) HSP emit. Cross-check
+   against the eu-stack histogram on the same workload.
+3. **Re-run bird_z_cross with variance.** Submit again with
    `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
    median + min/max for the chr-scale wall and stage breakdown.
-2. **Run `bird_z_cross_breakdown`** (default + nogapped on the same
+4. **Run `bird_z_cross_breakdown`** (default + nogapped on the same
    pair) to back out gapped-extension cost on real data, the same way
    we did for synthetic. Should reproduce the 91/8 split.
-3. **Build + run SegAlign on the same chrZ pair** for a CPU-vs-GPU
+5. **Build + run SegAlign on the same chrZ pair** for a CPU-vs-GPU
    datapoint. Their docker image avoids the build complexity.
-4. **Add an N-shard CPU baseline** to bench.py — launch N parallel
+6. **Add an N-shard CPU baseline** to bench.py — launch N parallel
    `lastz` subprocesses on disjoint target slices (chromosome shards),
    produce a "CPU scaling curve" so the GPU comparison isn't 1-core vs
    1-GPU.
-5. **Hardware counters.** Either fix `perf` (sysctl
-   `kernel.perf_event_paranoid=2`) or instrument `seed_hit_search` and
-   `ge_ydrop_one_sided_align` with `__rdtsc` counters for cycles + an
-   estimate of memory-bandwidth utilization. We need to know whether
-   the seed-hit hot loop is ALU- or memory-bound before designing a
-   GPU kernel for it.
-6. **Whole-genome runs.** Once chr-scale numbers look right, run
+7. **Hardware counters.** Either fix `perf` (sysctl
+   `kernel.perf_event_paranoid=2`) or rely on the rdtsc-instrumented
+   binary above for cycles + an estimate of memory-bandwidth
+   utilization. We need to know whether the seed-hit hot loop is ALU-
+   or memory-bound before designing a GPU kernel for it.
+8. **Whole-genome runs.** Once chr-scale numbers look right, run
    hg38 vs mm10 whole-genome (overnight job). That's the SegAlign
    headline benchmark.
 
 ---
 
-## 12. Gotchas, lessons learned, and "don't do that"
+## 13. Gotchas, lessons learned, and "don't do that"
 
 A list of things that wasted time during setup so they don't waste
 time again:
@@ -795,6 +1029,42 @@ time again:
   SegAlign-specific.** SegAlign uses lastz defaults. If you see those
   values in old notes, ignore them — verified against the SegAlign
   source.
+- **eu-stack can't ptrace siblings under `ptrace_scope=1`.** Even
+  though Ubuntu's default policy lets you ptrace your own children, if
+  you launch *both* eu-stack and lastz from the same parent, they're
+  siblings and eu-stack will fail with `dwfl_thread_getframes:
+  Operation not permitted`. The fix is in `profile_eustack.py`: have
+  the lastz child call `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` via
+  `subprocess.Popen(..., preexec_fn=...)`. Don't refactor that without
+  re-testing on a fresh shell.
+- **`os.kill(pid, 0)` returns success on zombies.** The first version
+  of `profile_eustack.py` used it as a "did the target exit" check and
+  ended up sampling a zombie thousands of times after lastz had already
+  finished. Use `subprocess.Popen.poll()` instead — that returns the
+  exit code as soon as the child becomes a zombie and we can stop the
+  sampling loop.
+- **`addr2line` on a PIE binary needs file offsets, not vaddrs.**
+  `lastz_T` is built as a PIE (default on modern toolchains), so
+  eu-stack's reported `0x55....` addresses are virtual addresses with
+  the ASLR-randomized base baked in. To resolve to file:line you must
+  capture the load base (we read `/proc/<pid>/maps` while the target
+  is alive) and subtract it before calling `addr2line`. Symptom of
+  forgetting: every line resolves to `??:?`.
+- **`eu-stack` doesn't print file:line, only function names.** It's a
+  stack walker, not a symbolizer. We do post-resolution via
+  `addr2line -e lastz_T -f -C -p <hex offsets>`. If you ever switch
+  profilers, anything that already prints file:line per frame will
+  Just Work — but eu-stack alone won't.
+- **GCC `-O3` partial-inlining mangles file:line attribution.**
+  `ydrop_one_sided_align.part.0` (a partial-inlining clone) shows up
+  in `top_lines.txt` at `seed_search.c:399` (the call site that pulled
+  it in), not `gapped_extend.c` where it's actually defined. Keep this
+  in mind when reading the line histogram — function names are still
+  correct, only the source location is "the call site".
+- **`--extra-arg=<value>` requires the `=` form** for any value that
+  starts with `--`. argparse won't accept `--extra-arg --format=maf-`
+  as two tokens (it sees `--format=maf-` as another flag). Use
+  `--extra-arg=--format=maf-`.
 
 ---
 
@@ -818,8 +1088,26 @@ python3 bench/bench.py --suite actb_matrix --reps 3
 sbatch --export=ALL,SUITE=bird_z_cross,REPS=1,RUN_NAME=bird_z_cross-$(date +%F) \
        bench/sbatch/run_bench.sbatch
 
+# Profile a single run with eu-stack (function + file:line histogram)
+python3 bench/profile_eustack.py \
+    --lastz lastz/src/lastz_T \
+    --target bench/data_genomes/galGal6.chrZ_0_10mb.fa \
+    --query  bench/data_genomes/taeGut2.chrZ_0_10mb.fa \
+    --out-dir bench/results/eustack-bird10mb-001 \
+    --rate-hz 100 --extra-arg=--format=maf-
+
+# Or via SLURM:
+sbatch --export=ALL,\
+    TARGET=bench/data_genomes/galGal6.chrZ_0_10mb.fa,\
+    QUERY=bench/data_genomes/taeGut2.chrZ_0_10mb.fa,\
+    OUT_DIR=bench/results/eustack-bird10mb-001 \
+    bench/sbatch/profile_eustack.sbatch
+
 # Inspect
 ls   bench/results/
 cat  bench/results/<run>/summary.csv | column -ts,
 cat  bench/results/<run>/runs/<wl>__<var>__rep0.stage.txt   # raw stage report
+cat  bench/results/<run>/top_funcs.txt                      # eu-stack profile
+cat  bench/results/<run>/top_lines.txt                      # eu-stack + addr2line
+head -10 bench/results/<run>/folded.txt                     # flamegraph input
 ```

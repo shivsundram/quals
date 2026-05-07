@@ -1,0 +1,19 @@
+{
+  "lastz": "lastz/src/lastz_T",
+  "target": "bench/data/uniform_1000kb.target.fa",
+  "query": "bench/data/uniform_1000kb.query.fa",
+  "extra_args": [
+    "--format=maf-"
+  ],
+  "rate_hz": 200.0,
+  "interval_ms": 5.0,
+  "max_samples": null,
+  "started_at": "2026-05-07T10:37:30",
+  "wall_s": 4.127721786499023,
+  "lastz_exit": 0,
+  "samples_attempted": 313,
+  "samples_with_stack": 312,
+  "samples_failed": 1,
+  "unique_stacks": 14,
+  "load_base_hex": "0x557982e98000"
+}
