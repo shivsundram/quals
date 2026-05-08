@@ -2,3 +2,6 @@
 	path = lastz
 	url = git@github.com:shivsundram/lastz.git
 	branch = stage-timing+rdtsc-substages
+[submodule "SegAlign"]
+	path = SegAlign
+	url = git@github.com:gsneha26/SegAlign.git
