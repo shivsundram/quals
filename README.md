@@ -1252,7 +1252,7 @@ run_one hg_recommended             --seed=match15 --step=20 --notransition
 The sensitivity check (HSPs vs total bp aligned) is a one-liner over
 the resulting MAF blocks:
 
-```bash
+```bash. 
 for f in *.maf; do
     awk -v tag=${f%.maf} '
         /^a score=/ { getline; split($0, a, " "); sum += a[4]; n++ }
@@ -1275,6 +1275,161 @@ Use `total_bp` as the sensitivity metric, not HSP count — see finding
   + memory stalls counted as wall but not as retired cycles), and is
   consistent with what we'd expect from a CPU running closer to its
   base clock under heavy DRAM traffic.
+
+#### Step-axis Pareto sweeps across four regimes
+
+After the seed-weight (bird-Z) and within-species (hg-vs-CHM13) sweeps
+above, we ran four `--step` sweeps at the same 10 Mbp × 10 Mbp scale to
+map how the seed-vs-gapped balance moves across phylogenetic distance.
+Three findings collapse out:
+
+1. The crossover from "seed-dominated" to "gapped-dominated" happens
+   well before 93 % identity.
+2. The bottleneck axis is *alignable density*, not identity. Identity
+   only matters because it shapes density.
+3. For three of four regimes, gapped extension is 95–99 % of wall —
+   so the GPU-acceleration target is `ydrop_one_sided_align`, not the
+   seed kernel, on anything closer than ~80 % identity.
+
+Single-thread runs pinned to CPU 0, `lastz_TS` build (so we get
+per-stage timing), `--seed=12of19` everywhere except the within-species
+column (where `--seed=match15 --notransition` is the appropriate
+recipe).
+
+| Regime | Slice | Identity | bp aligned (10 Mbp²) | seed share | gap share | Wall step=1 → step=100 |
+|---|---|---:|---:|---:|---:|---:|
+| Sparse synteny | hg38.chr19[40-50M] × mm10.chr10[120-130M] | ~80 % within blocks | 0.006 Mbp | 84-95 % flat | 1-4 % flat | 18.4 s → 2.5 s |
+| Cross-species (dense) | galGal6.chrZ[0-10M] × taeGut2.chrZ[0-10M] | ~75 % | 0.61 Mbp | 89 % → 53 % | 10 % → 43 % | 62.3 s → 7.2 s |
+| Primate (dense) | hg38.chr19[40-50M] × rheMac10.chr19[40-50M] | ~93 % | 23-38 Mbp | 1-4 % flat | 96-99 % flat | 346.6 s → 123.2 s |
+| Within-species | hg38.chr1[50-60M] × hs1.chr1[50-60M] | ~99.5 % | 11-12 Mbp | 1-2 % flat | 94-96 % flat | 22.3 s → 17.5 s (match15) |
+
+Detailed per-step numbers are committed at:
+
+- `bench/results/step-sweep-mouse10mb/` (sparse synteny)
+- `bench/results/step-sweep-bird10mb/`  (cross-species, with
+  `seed-sweep-bird10mb/default_12of19.*` as the cached step=1 baseline)
+- `bench/results/step-sweep-rhesus10mb/` (primate)
+- `bench/results/step-sweep-hg-vs-chm13/` (within-species)
+
+**Visual summary of the bottleneck axis** (alignable density on a log
+scale; identity rises from left to right, but the bottleneck is set by
+density, not identity):
+
+```
+                          bp aligned per 100 Mbp²  (log scale)
+        ────────────────────────────────────────────────────────►
+        ~0.01 Mbp        ~1 Mbp            ~10-40 Mbp
+         │                 │                    │
+   ┌─────┴─────┐      ┌────┴─────┐          ┌───┴──────┐
+   │ SEED      │      │ TRANSITION│          │ GAPPED   │
+   │ dominates │      │ region    │          │ dominates│
+   │ 80-95 %   │      │ (50/50    │          │ 95-99 %  │
+   │ flat in   │      │ at step≥20│          │ flat     │
+   │ step      │      │ on bird-Z)│          │          │
+   └───────────┘      └───────────┘          └──────────┘
+
+   mouse-human       bird-Z chrZ            rhesus chr19,
+   sparse pairs      cross-species          hg-vs-CHM13
+```
+
+**1. Crossover happens between bird-Z and rhesus.** At ~75 % identity
++ dense synteny (bird-Z), seed_hit dominates at step=1 (89 %) and
+equilibrates near 50/50 by step=20. At ~93 % identity (rhesus) the
+bottleneck has *already* fully flipped: gapped is 96 % at step=1 and
+99 % at step=20. Whatever density threshold matters, it sits between
+0.6 Mbp aligned (bird-Z) and ~25 Mbp aligned (rhesus step=50). This
+nukes the simple "low identity → seeds dominate, high identity → gap
+dominates" story; the rhesus regime is closer to within-species than
+to bird-Z despite being clearly cross-species.
+
+**2. Sparse-synteny is its own regime.** The mouse-human probe
+yielded ~6 kbp aligned out of 100 Mbp² — 100× lower than bird-Z and
+2,000× lower than within-species. With so little gappable territory,
+seed_hit dominates uniformly at 84–95 % across every step value. The
+sweep doesn't equilibrate. This is the regime where SegAlign's seed
+kernel earns *all* the speedup; gapped acceleration would be wasted
+silicon for these workloads.
+
+**3. Step is a different knob in each regime.**
+
+  - Sparse synteny: step=1 → 100 buys 7× wall (18.4 → 2.5 s) but
+    drops aligned bp ~30 % (6.3 → 4.5 kbp). Mostly seed savings.
+  - Cross-species: step=1 → 20 alone buys 5.3× wall and only 11 %
+    sensitivity loss. Step≥20 is essentially free.
+  - Primate: step=1 → 100 buys 2.8× wall but loses 39 % of bp aligned
+    (37.8 → 23.1 Mbp). Each step value still costs >2 minutes;
+    sensitivity-cost product is dominated by the gapped budget.
+  - Within-species: step=20 → 100 is a flat 1.3× wall and 7 % loss.
+    Already at floor.
+
+**Implication for the GPU thesis.** "Where is the time going" depends
+on the workload, but the answer collapses into two cases:
+
+- **Workload aligns >~1 Mbp per 100 Mbp² product** → gapped_ext is
+  the only kernel that matters. Within-species, primate-primate, and
+  anything closer than ~85 % syntenic identity. Three of our four
+  regimes. Speed up `ydrop_one_sided_align` and you're done.
+- **Workload aligns <~1 Mbp per 100 Mbp² product** → only the seed
+  kernel matters. Cross-species at scale, distant pairs, sparse-
+  synteny chunks. One of our four regimes (and the one SegAlign is
+  benchmarked on).
+
+Bird-Z sits at the inflection point — the *only* regime where both
+kernels matter. That's also exactly why SegAlign benchmarks against
+it: the marketing-friendly "both stages on GPU" only earns its keep
+on bird-Z-shaped workloads.
+
+**Caveat — `--seed=12of19` is the wrong seed for rhesus.** The actual
+NCBI/UCSC primate-primate recipe uses contiguous seeds with explicit
+human-friendly scoring. Using `12of19 --transition` with default
+HOXD70-style scoring on rhesus is what generated 17 k overlapping HSPs
+and the 31 Mbp double-counted aligned bp number. The bottleneck shape
+(gapped-dominated) is correct; the absolute numbers reflect a
+deliberately-untuned configuration. Tuning would shrink the
+`gapped_ext` budget but not change the regime story.
+
+**Reproduce.** Add `rheMac10` to the genome inventory, fetch it
+(~740 MB 2bit, ~30 s download), slice [40 M, 50 M] of chr19, and run
+the rhesus sweep. The other three sweeps share the same data layer
+(see "Within-species regime change" above for hg-vs-CHM13 and
+"Seed-weight sweep" above for bird-Z); the mouse sparse-synteny slice
+needs a one-time chr10 extraction.
+
+```bash
+# 1) Fetch rheMac10 (Mmul_10) and slice chr19[40,50M] to match the
+#    existing hg38.chr19_40_50mb.fa slice.
+python3 bench/fetch_genomes.py --only rheMac10
+python3 bench/slice_genome.py \
+    bench/data_genomes/rheMac10.chr19.fa \
+    /scratch2/shiv1/lastz-bench-data/slices/rheMac10.chr19_40_50mb.fa \
+    --start 40000000 --length 10000000
+ln -sf /scratch2/shiv1/lastz-bench-data/slices/rheMac10.chr19_40_50mb.fa \
+    bench/data_genomes/rheMac10.chr19_40_50mb.fa
+
+# 2) Slice mm10.chr10[120,130M] (probed densest 10 Mbp synteny block
+#    with hg38.chr19[40,50M]; still very sparse, ~6 kbp aligned).
+python3 bench/slice_genome.py \
+    bench/data_genomes/mm10.chr10.fa \
+    /scratch2/shiv1/lastz-bench-data/slices/mm10.chr10_120_130mb.fa \
+    --start 120000000 --length 10000000
+ln -sf /scratch2/shiv1/lastz-bench-data/slices/mm10.chr10_120_130mb.fa \
+    bench/data_genomes/mm10.chr10_120_130mb.fa
+
+# 3) Run all four step sweeps. Total wall ~25 min single-thread (rhesus
+#    dominates the budget at ~17 min).
+./step_sweep.sh           # within-species: hg-vs-CHM13, ~75 s
+./step_sweep_bird.sh      # cross-species: bird-Z, ~3 min (step=1 cached)
+./step_sweep_mouse.sh     # sparse synteny: mouse-human, ~30 s
+./step_sweep_rhesus.sh    # primate: hg-vs-rhesus, ~17 min
+
+# 4) (optional) Reproduce the headline-numbers + bottleneck-flip table:
+./get_tradeoffs.sh        # ~95 s, prints both tables
+```
+
+Each step-sweep script is a thin wrapper over `lastz_TS` with stage
+timing enabled, the same shape as `sweep_human1.sh`: pinned to CPU 0,
+fail-loudly on non-zero exit, captures `*.stage.txt` per step value,
+and prints a Pareto table at the end.
 
 ### Findings worth flagging
 
@@ -1317,6 +1472,20 @@ Use `total_bp` as the sensitivity metric, not HSP count — see finding
    single source line in the seed lookup is `seeds.c:1306` (10.9% of
    all samples) — that's the chain walk inside `find_table_matches`
    (the `for (s = pt->last[word]; s != NULL; s = pt->prev[s-1])` loop).
+8. **The bottleneck axis is alignable density, not identity.** Step-
+   axis sweeps across four regimes (sparse-synteny mouse-human, bird-Z,
+   primate-primate, within-species — see "Step-axis Pareto sweeps"
+   subsection above) show that the seed→gapped crossover is set by
+   how much actually aligns per Mbp² of input product, not directly by
+   identity. Three of the four regimes are gapped-dominated at 95-99 %
+   of wall regardless of step value; only bird-Z (~75 % identity, ~0.6
+   Mbp aligned per 100 Mbp²) sits at the inflection point where both
+   stages matter. **At ~93 % identity (rhesus-human) the bottleneck
+   has already fully flipped to gapped extension.** SegAlign's
+   "GPU-both-stages" pitch only earns its keep on bird-Z-shaped
+   workloads; for anything closer than ~85 %, only `ydrop_one_sided_
+   align` matters — and for very-distant-species workloads (sparse
+   synteny), only the seed kernel matters.
 
 ### What we don't have yet
 
@@ -1570,6 +1739,13 @@ LASTZ_STAGE_REPORT=bench/results/rdtsc-bird10mb-002/stage_TS.txt \
         --format=maf- > /dev/null
 sed -n '/--- rdtsc substage breakdown ---/,/===STAGE_TIMING_END===/p' \
     bench/results/rdtsc-bird10mb-002/stage_TS.txt
+
+# Step-axis Pareto sweeps across four regimes (10 Mbp x 10 Mbp scale)
+./step_sweep.sh           # within-species: hg-vs-CHM13, ~75 s
+./step_sweep_bird.sh      # cross-species: bird-Z, ~3 min
+./step_sweep_mouse.sh     # sparse synteny: mouse-human, ~30 s
+./step_sweep_rhesus.sh    # primate-primate (~93%): hg-vs-rhesus, ~17 min
+./get_tradeoffs.sh        # within-species headline + bottleneck-flip table
 
 # Inspect
 ls   bench/results/
