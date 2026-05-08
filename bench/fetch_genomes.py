@@ -72,6 +72,10 @@ GENOMES: list[Genome] = [
                  "Pairs with hg38 for human-vs-human (~99.9%% identity) experiments."),
     Genome("mm10",    "mouse (Mus musculus)",         2.72, "chr10",
            notes="GRCm38, Jan 2012. Matches what SegAlign benchmarks against."),
+    Genome("rheMac10","rhesus macaque (Macaca mulatta)", 2.94, "chr19",
+           notes="Mmul_10, Feb 2019. ~93% identity with hg38 in syntenic regions; "
+                 "primate sister taxon, useful as a true mid-identity regime point "
+                 "between hg-vs-CHM13 (~99.5%) and bird-Z (~75%)."),
     Genome("galGal6", "chicken (Gallus gallus)",      1.05, "chrZ",
            notes="Mar 2018. Bird sex chr Z; birds are ZW (males ZZ, females ZW)."),
     Genome("taeGut2", "zebra finch (Taeniopygia guttata)", 1.02, "chrZ",
