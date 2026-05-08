@@ -1,0 +1,35 @@
+===STAGE_TIMING_BEGIN===
+total run time:            11.804
+sequence 1 I/O:            0.221
+seed position table:       0.100
+sequence 2 I/O:            0.207
+seed hit search:           6.323
+chaining:                  0.000
+gapped extension:          4.942
+interpolation:             0.000
+output:                    0.006
+total query time:          11.482
+queries:                   1
+per query (with I/O):      11.482 (0.1 per second)
+per query (w/o input):     11.275 (0.1 per second)
+total time in above_below(): 0.000
+total time in left_right(): 0.001
+total time in ydrop_align(): 4.925
+    ydrop_one_sided_align(): 4.925
+    update_lr_bounds():    0.025
+    next_sweep_seg():      0.000
+    prev_sweep_seg():      0.000
+    update_active_segs():  0.079
+    filter_active_segs():  0.025
+--- rdtsc substage breakdown ---
+substage                                 total_cycles          calls/iters         cyc/call
+ftm.chain_walk                              354938894              8259085             43.0
+ftm.processor_callback                     4960659794              8259085            600.6
+ftm.calls                                           0            225693598                -
+pfs.calls_total                                     0              8259085                -
+pfs.dedup_short_circuit                        126854                 3423             37.1
+xdrop_extend_seed_hit                      4448071890              8255662            538.8
+  └─ xdrop.no_score_returns                     0              8254669                -
+reporter_callback                              152518                  993            153.6
+# pfs subtree total: 4448351262 cyc  (vs ftm.processor_cyc: 4960659794, delta = 512308532 due to pfs body itself + dispatch)
+===STAGE_TIMING_END===

@@ -1,18 +1,18 @@
-	Command being timed: "env LASTZ_STAGE_REPORT=bigger_seed_match15.stage.txt taskset -c 0 /home/shiv1/quals/lastz/src/lastz_TS /home/shiv1/quals/bench/data_genomes/hg38.chr1_50_60mb.fa /home/shiv1/quals/bench/data_genomes/hs1.chr1_50_60mb.fa --seed=match15 --format=maf-"
-	User time (seconds): 26.25
-	System time (seconds): 0.54
+	Command being timed: "env LASTZ_STAGE_REPORT=bench/results/seed-sweep-hg-vs-chm13/bigger_seed_match15.stage.txt taskset -c 0 /home/shiv1/quals/lastz/src/lastz_TS /home/shiv1/quals/bench/data_genomes/hg38.chr1_50_60mb.fa /home/shiv1/quals/bench/data_genomes/hs1.chr1_50_60mb.fa --seed=match15 --format=maf-"
+	User time (seconds): 27.24
+	System time (seconds): 0.49
 	Percent of CPU this job got: 99%
-	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:26.81
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:27.74
 	Average shared text size (kbytes): 0
 	Average unshared data size (kbytes): 0
 	Average stack size (kbytes): 0
 	Average total size (kbytes): 0
-	Maximum resident set size (kbytes): 1146440
+	Maximum resident set size (kbytes): 1146444
 	Average resident set size (kbytes): 0
-	Major (requiring I/O) page faults: 1
-	Minor (reclaiming a frame) page faults: 543603
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 543602
 	Voluntary context switches: 1
-	Involuntary context switches: 2349
+	Involuntary context switches: 2454
 	Swaps: 0
 	File system inputs: 79721
 	File system outputs: 48445

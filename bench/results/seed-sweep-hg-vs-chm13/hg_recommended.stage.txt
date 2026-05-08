@@ -1,35 +1,35 @@
 ===STAGE_TIMING_BEGIN===
-total run time:            21.466
-sequence 1 I/O:            0.156
-seed position table:       0.246
-sequence 2 I/O:            0.135
-seed hit search:           0.371
+total run time:            21.543
+sequence 1 I/O:            0.146
+seed position table:       0.248
+sequence 2 I/O:            0.159
+seed hit search:           0.357
 chaining:                  0.000
-gapped extension:          20.462
+gapped extension:          20.490
 interpolation:             0.000
-output:                    0.091
-total query time:          21.064
+output:                    0.139
+total query time:          21.149
 queries:                   1
-per query (with I/O):      21.064 (0.0 per second)
-per query (w/o input):     20.929 (0.0 per second)
+per query (with I/O):      21.149 (0.0 per second)
+per query (w/o input):     20.990 (0.0 per second)
 total time in above_below(): 0.003
-total time in left_right(): 0.049
-total time in ydrop_align(): 20.336
-    ydrop_one_sided_align(): 20.336
+total time in left_right(): 0.050
+total time in ydrop_align(): 20.364
+    ydrop_one_sided_align(): 20.364
     update_lr_bounds():    0.264
     next_sweep_seg():      0.001
     prev_sweep_seg():      0.001
-    update_active_segs():  0.909
-    filter_active_segs():  0.297
+    update_active_segs():  0.905
+    filter_active_segs():  0.296
 --- rdtsc substage breakdown ---
 substage                                 total_cycles          calls/iters         cyc/call
 ftm.chain_walk                                      0                    0              0.0
 ftm.processor_callback                              0                    0              0.0
 ftm.calls                                           0                    0                -
 pfs.calls_total                                     0               218955                -
-pfs.dedup_short_circuit                      20792958               192389            108.1
-xdrop_extend_seed_hit                        24125886                26566            908.1
+pfs.dedup_short_circuit                      20350044               192389            105.8
+xdrop_extend_seed_hit                        24086624                26566            906.7
   └─ xdrop.no_score_returns                     0                11719                -
-reporter_callback                             1091290                14847             73.5
-# pfs subtree total: 46010134 cyc  (vs ftm.processor_cyc: 0, delta = -46010134 due to pfs body itself + dispatch)
+reporter_callback                             1083972                14847             73.0
+# pfs subtree total: 45520640 cyc  (vs ftm.processor_cyc: 0, delta = -45520640 due to pfs body itself + dispatch)
 ===STAGE_TIMING_END===
