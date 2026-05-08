@@ -1085,6 +1085,47 @@ heavier seeds are the right pick for closer species. **Seed weight is
 a sensitivity dial, not an algorithmic fix** — the dense-array layout
 + GPU x-drop wins remain the structural ones.
 
+**Reproduce.** Prereqs: `lastz_TS` built (`make -C lastz
+build_lastz_substages`), and the bird-Z 10 Mbp slices already on disk
+(`bench/data_genomes/galGal6.chrZ_0_10mb.fa` and
+`taeGut2.chrZ_0_10mb.fa` — produced earlier; see §5.4).
+
+```bash
+mkdir -p bench/results/seed-sweep-bird10mb
+cd bench/results/seed-sweep-bird10mb
+
+TARGET=$(realpath ../../../bench/data_genomes/galGal6.chrZ_0_10mb.fa)
+QUERY=$(realpath ../../../bench/data_genomes/taeGut2.chrZ_0_10mb.fa)
+LASTZ=$(realpath ../../../lastz/src/lastz_TS)
+
+run_one() {
+    local tag="$1"; shift
+    /usr/bin/time -v -o ${tag}.time.txt \
+        env LASTZ_STAGE_REPORT=${tag}.stage.txt \
+            taskset -c 0 \
+            "$LASTZ" "$TARGET" "$QUERY" "$@" --format=maf- \
+            > ${tag}.maf 2>${tag}.err
+    local hsp=$(grep -c '^a score=' ${tag}.maf)
+    local wall=$(grep 'Elapsed (wall' ${tag}.time.txt | awk '{print $NF}')
+    local seedhit=$(grep '^seed hit search:' ${tag}.stage.txt | awk '{print $NF}')
+    echo "$tag: wall=$wall  seed_hit=${seedhit}s  HSPs=$hsp"
+}
+
+run_one default_12of19                       # bare command, default --seed=12of19
+run_one heavy_14of22       --seed=14of22
+run_one contig_match12     --seed=match12
+```
+
+Each variant takes ~1 minute (default), ~17 s (heavy), or ~10 s
+(contig). Total ~90 s on a head-node CPU 0. The rdtsc substage block
+appears between `===STAGE_TIMING_BEGIN===` / `===STAGE_TIMING_END===`
+markers in `<tag>.stage.txt`; pull it out with:
+
+```bash
+sed -n '/--- rdtsc substage breakdown/,/===STAGE_TIMING_END/p' \
+    default_12of19.stage.txt
+```
+
 #### Within-species regime change: hg38 vs T2T-CHM13 chr1:50M-60M
 
 To pressure-test the seed-tuning intuition at the *opposite* end of
@@ -1154,6 +1195,74 @@ result (the work happens in the un-instrumented function); xdrop and
 reporter timers are unaffected. Adding the same `__rdtsc()` block to
 `find_table_matches_resolve` is a small follow-up if we want full
 substage coverage on overweight seeds.
+
+**Reproduce.** Prereqs: `lastz_TS` built (`make -C lastz
+build_lastz_substages`); hs1 (T2T-CHM13) fetched and chr1 extracted
+from both human assemblies. The data fetch is one-time and ~30 s for
+the download itself plus ~20 s for the chr1 extraction:
+
+```bash
+# 1) Fetch T2T-CHM13 (UCSC code "hs1") — ~775 MB 2bit, ~30 s download.
+#    Skips if already cached at /scratch2/shiv1/lastz-bench-data/2bit/.
+python3 bench/fetch_genomes.py --only hs1
+
+# 2) Extract chr1 from hg38 (only chr19 was extracted by default) and
+#    symlink alongside hs1.chr1.fa which fetch_genomes.py made above.
+python3 -m bench.twobit extract \
+    /scratch2/shiv1/lastz-bench-data/2bit/hg38.2bit chr1 \
+    /scratch2/shiv1/lastz-bench-data/slices/hg38.chr1.fa
+ln -sf /scratch2/shiv1/lastz-bench-data/slices/hg38.chr1.fa \
+    bench/data_genomes/hg38.chr1.fa
+
+# 3) Slice 10 Mbp at chr1:50M-60M (gene-rich p-arm, no N-blocks here).
+python3 bench/slice_genome.py \
+    bench/data_genomes/hg38.chr1.fa \
+    bench/data_genomes/hg38.chr1_50_60mb.fa \
+    --start 50000000 --length 10000000 --rename hg38_chr1_50M_60M
+python3 bench/slice_genome.py \
+    bench/data_genomes/hs1.chr1.fa \
+    bench/data_genomes/hs1.chr1_50_60mb.fa \
+    --start 50000000 --length 10000000 --rename hs1_chr1_50M_60M
+```
+
+Then the sweep itself (~95 s wall, single-thread CPU 0):
+
+```bash
+mkdir -p bench/results/seed-sweep-hg-vs-chm13
+cd bench/results/seed-sweep-hg-vs-chm13
+
+TARGET=$(realpath ../../../bench/data_genomes/hg38.chr1_50_60mb.fa)
+QUERY=$(realpath  ../../../bench/data_genomes/hs1.chr1_50_60mb.fa)
+LASTZ=$(realpath  ../../../lastz/src/lastz_TS)
+
+run_one() {
+    local tag="$1"; shift
+    /usr/bin/time -v -o ${tag}.time.txt \
+        env LASTZ_STAGE_REPORT=${tag}.stage.txt \
+            taskset -c 0 \
+            "$LASTZ" "$TARGET" "$QUERY" "$@" --format=maf- \
+            > ${tag}.maf 2>${tag}.err
+}
+
+run_one cross_species_default                                              # default --seed=12of19
+run_one bigger_seed_match15        --seed=match15
+run_one hg_recommended             --seed=match15 --step=20 --notransition
+```
+
+The sensitivity check (HSPs vs total bp aligned) is a one-liner over
+the resulting MAF blocks:
+
+```bash
+for f in *.maf; do
+    awk -v tag=${f%.maf} '
+        /^a score=/ { getline; split($0, a, " "); sum += a[4]; n++ }
+        END { printf "%-25s HSPs=%d total_bp=%d mean=%d\n",
+                     tag, n, sum, n ? sum/n : 0 }' "$f"
+done
+```
+
+Use `total_bp` as the sensitivity metric, not HSP count — see finding
+#2 above for why.
 
 **Cycle accounting against wall time.** Bird-Z 10 Mbp at 62.3 s:
 - Chain walk: 20.6 G cyc → ~7 s (assuming 3 GHz; could be less at
