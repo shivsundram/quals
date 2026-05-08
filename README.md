@@ -1085,6 +1085,76 @@ heavier seeds are the right pick for closer species. **Seed weight is
 a sensitivity dial, not an algorithmic fix** — the dense-array layout
 + GPU x-drop wins remain the structural ones.
 
+#### Within-species regime change: hg38 vs T2T-CHM13 chr1:50M-60M
+
+To pressure-test the seed-tuning intuition at the *opposite* end of
+the divergence spectrum, we ran the same 10 Mbp × 10 Mbp matrix using
+two human assemblies (~99.5–99.9 % identity in single-copy regions) at
+`chr1:50,000,000-60,000,000`. Three variants, same `lastz_TS` binary,
+single-thread CPU 0. Full numbers in
+`bench/results/seed-sweep-hg-vs-chm13/SUMMARY.md`.
+
+| Variant | Wall | seed_hit | gapped_ext | HSPs | bp aligned |
+|---|---:|---:|---:|---:|---:|
+| `--seed=12of19` (cross-species default) | 47.6 s | 18.2 s | 28.5 s | 2474 | 12.44 Mbp |
+| `--seed=match15` (bigger contig seed) | 26.8 s | **0.83 s** | 24.9 s | 1798 | 12.12 Mbp |
+| `--seed=match15 --step=20 --notransition` | 21.5 s | **0.37 s** | 20.5 s | 943 | 11.33 Mbp |
+
+Three findings worth pulling out:
+
+**1. The bottleneck *flips* at high identity.** On bird-Z 10 Mbp cross-
+species (~75 % identity), `seed_hit_search` was 88 % of total wall
+time. On hg38-vs-CHM13 with cross-species defaults it's already only
+38 %; with `--seed=match15 --step=20` it drops to 2 %. **Gapped
+extension goes from 10 % to 95 % of runtime.** Within-species and
+cross-species are not the same problem. SegAlign's GPU port of *both*
+seed_hit_search and gapped extension is essential — accelerating only
+the seed lookup would leave ~95 % of the runtime on the CPU for
+within-species workflows.
+
+**2. HSP count is a misleading sensitivity metric.** Going from
+`12of19` to `match15+step=20+notransition` drops HSP count by 62 %
+(2474 → 943) but **total bp aligned drops only 9 %** (12.44 → 11.33
+Mbp), and **mean HSP length more than doubles** (5,029 → 12,014 bp).
+Maximum HSP length is identical (~448 kbp) across all three. The
+"missing" HSPs aren't missing homology — they're short fragments that
+get reported as a single longer HSP when the seed grid is sparser.
+**Use total-bp-aligned, not HSP count, to compare sensitivity across
+seed configurations.**
+
+**3. seed_hit_search wall savings don't translate 1:1 to total wall
+speedup.** seed_hit_search drops 49× (18.2 s → 0.37 s) but total wall
+only drops 2.2× (47.6 s → 21.5 s). Why: gapped extension is the new
+bottleneck and it shrinks only ~30 % (28.5 s → 20.5 s) — set by the
+amount of homology found, not by the seed machinery. **To get bigger
+wall wins on within-species data, the GPU must also accelerate gapped
+extension.** This is exactly what SegAlign does (its `processSegment`
+kernel does banded x-drop on GPU); the seed-only fix is necessary but
+not sufficient at this regime.
+
+Combined cross-species + within-species picture for the GPU port:
+
+| Regime | Bird-Z cross-species | hg-vs-CHM13 within-species |
+|---|---:|---:|
+| Identity | ~75 % | ~99.5 % |
+| seed_hit_search share | 88 % | 38 % → 2 % with tuning |
+| gapped_extension share | 10 % | 60 % → 95 % with tuning |
+| Where does GPU help most? | Chain walk + x-drop kernels | Gapped extension kernel |
+
+**The takeaway is structural**: depending on the use case, "where does
+the time go" shifts dramatically. A serious GPU-accelerated lastz needs
+to attack both bottlenecks because the same tool serves both regimes.
+
+Caveat on rdtsc coverage: `match15` has bit-weight 30, which exceeds
+the 24-bit max packed-index size, so lastz takes the "overweight seed"
+path through `find_table_matches_resolve()` — a different function
+than the `find_table_matches()` we instrumented for the bird-Z
+sweep. The chain-walk substage timer reads 0 on these runs as a
+result (the work happens in the un-instrumented function); xdrop and
+reporter timers are unaffected. Adding the same `__rdtsc()` block to
+`find_table_matches_resolve` is a small follow-up if we want full
+substage coverage on overweight seeds.
+
 **Cycle accounting against wall time.** Bird-Z 10 Mbp at 62.3 s:
 - Chain walk: 20.6 G cyc → ~7 s (assuming 3 GHz; could be less at
   turbo throttling)
@@ -1163,6 +1233,18 @@ a sensitivity dial, not an algorithmic fix** — the dense-array layout
   that — same algorithm, contiguous instead of linked-list — is the
   obvious first optimization based on the rdtsc finding that the
   chain walk is DRAM-latency bound at 10 Mbp.
+- **Gapped-extension acceleration.** The hg-vs-CHM13 within-species
+  data showed gapped extension at 95 % of runtime once seed_hit_search
+  is properly tuned. We don't yet have rdtsc-level instrumentation
+  inside `gapped_extend.c` to know whether y-drop's hot loop is
+  memory- or compute-bound. SegAlign's GPU port handles this kernel
+  via banded x-drop on GPU; mirroring that on the CPU side first would
+  give us the same kind of A/B baseline we have for the seed table.
+- **rdtsc instrumentation for `find_table_matches_resolve`.** The
+  overweight-seed path (any seed with bit-weight > 24, e.g. `match15`)
+  bypasses our current substage timers. Small patch to fix; only
+  worthwhile if we want substage breakdowns on within-species
+  workloads.
 
 ### Confirmed facts about LASTZ itself
 
@@ -1210,24 +1292,30 @@ In rough order:
    `ftm.chain_walk` on bird-Z 10 Mbp by letting the hardware
    prefetcher hide DRAM latency. Add the `__rdtsc` timers from #1 to
    the new path so we can A/B with apples-to-apples cycle numbers.
-3. **Re-run bird_z_cross with variance.** Submit again with
+3. **Instrument `gapped_extend.c` with rdtsc substage counters.** The
+   hg-vs-CHM13 within-species runs showed gapped extension is 95 % of
+   runtime once seed_hit_search is properly tuned. We need substage
+   breakdown on `ydrop_one_sided_align` (the inner y-drop loop) before
+   we can design a GPU kernel for it. Mirror the seed_search
+   instrumentation pattern from #1.
+4. **Re-run bird_z_cross with variance.** Submit again with
    `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
    median + min/max for the chr-scale wall and stage breakdown.
-4. **Run `bird_z_cross_breakdown`** (default + nogapped on the same
+5. **Run `bird_z_cross_breakdown`** (default + nogapped on the same
    pair) to back out gapped-extension cost on real data, the same way
    we did for synthetic. Should reproduce the 91/8 split.
-5. **Build + run SegAlign on the same chrZ pair** for a CPU-vs-GPU
+6. **Build + run SegAlign on the same chrZ pair** for a CPU-vs-GPU
    datapoint. Their docker image avoids the build complexity.
-6. **Add an N-shard CPU baseline** to bench.py — launch N parallel
+7. **Add an N-shard CPU baseline** to bench.py — launch N parallel
    `lastz` subprocesses on disjoint target slices (chromosome shards),
    produce a "CPU scaling curve" so the GPU comparison isn't 1-core vs
    1-GPU.
-7. **Hardware counters.** Either fix `perf` (sysctl
+8. **Hardware counters.** Either fix `perf` (sysctl
    `kernel.perf_event_paranoid=2`) or rely on the rdtsc-instrumented
    binary above for cycles + an estimate of memory-bandwidth
    utilization. We need to know whether the seed-hit hot loop is ALU-
    or memory-bound before designing a GPU kernel for it.
-8. **Whole-genome runs.** Once chr-scale numbers look right, run
+9. **Whole-genome runs.** Once chr-scale numbers look right, run
    hg38 vs mm10 whole-genome (overnight job). That's the SegAlign
    headline benchmark.
 

@@ -61,9 +61,15 @@ class Genome:
 
 
 # Same set SegAlign uses, so our wall-times can be directly compared to theirs.
+# We also pull T2T-CHM13 (UCSC code "hs1") so we can run within-species
+# (human-vs-human, ~99.9% identity) seed-weight experiments — the regime
+# where bigger seeds + step>1 actually pay off.
 GENOMES: list[Genome] = [
     Genome("hg38",    "human (Homo sapiens)",        3.08, "chr19",
            notes="GRCh38, Dec 2013. Gene-rich chr19 is mostly syntenic with mouse chr10."),
+    Genome("hs1",     "human T2T-CHM13v2.0",         3.05, "chr1",
+           notes="Jan 2022. Complete telomere-to-telomere human assembly. "
+                 "Pairs with hg38 for human-vs-human (~99.9%% identity) experiments."),
     Genome("mm10",    "mouse (Mus musculus)",         2.72, "chr10",
            notes="GRCm38, Jan 2012. Matches what SegAlign benchmarks against."),
     Genome("galGal6", "chicken (Gallus gallus)",      1.05, "chrZ",
