@@ -1048,6 +1048,43 @@ the `hashedDiag` math, the `gfExtend` dispatch, and call/ret overhead.
 Same ~15 % gap on synthetic; the bookkeeping is consistent across
 workloads.
 
+#### Seed-weight sweep — sensitivity vs. speed on the same workload
+
+Quick A/B/C with three seed shapes on bird-Z 10 Mbp (full numbers and
+analysis in `bench/results/seed-sweep-bird10mb/SUMMARY.md`):
+
+| Variant | Wall | Chain iters | HSPs | Sens. vs default |
+|---|---:|---:|---:|---:|
+| `--seed=12of19` (default) | 62.3 s | 164.8 M | 510 | 100 % |
+| `--seed=14of22` (heavy spaced) | **17.1 s** (3.6×) | 13.2 M | 490 | **96.1 %** |
+| `--seed=match12` (contiguous) | **10.4 s** (6.0×) | 18.7 M | 436 | **85.5 %** |
+
+What the cycle-level data adds:
+
+- The **chain-walk cyc/iter is identical** for `12of19` and `match12`
+  (125 cyc/iter both) — the DRAM-latency cost is set by the table
+  layout, not the seed shape. Heavier seeds shrink the absolute hit
+  count but don't fix the memory pattern; the dense-array layout fix
+  is orthogonal to seed weight.
+- **Dedup short-circuits 27 % of `match12` calls but only 1 % of
+  `12of19` calls.** Diagonal dedup was designed for contiguous seeds;
+  spaced seeds' don't-care positions scatter repeats across many
+  buckets and do dedup's job before lookup. SegAlign throwing dedup
+  away costs even less than the 1 % we measured for the default seed.
+- The **99.99 % x-drop failure rate is structural**, not seed-dependent.
+  All three variants land at >99.98 % `noScore`. Heavier seeds reduce
+  the absolute count of failed extensions but don't change the success
+  rate. The GPU's "embarrassingly parallel failure" win applies at any
+  seed weight.
+
+Practical takeaway: `14of22` is a near-Pareto win for cross-species
+alignment at vertebrate-scale divergence (~3.6× speedup, ~4 %
+sensitivity loss). SegAlign keeping `12of19` as the safe default makes
+sense for "we want to handle anything from primates to fish" but
+heavier seeds are the right pick for closer species. **Seed weight is
+a sensitivity dial, not an algorithmic fix** — the dense-array layout
++ GPU x-drop wins remain the structural ones.
+
 **Cycle accounting against wall time.** Bird-Z 10 Mbp at 62.3 s:
 - Chain walk: 20.6 G cyc → ~7 s (assuming 3 GHz; could be less at
   turbo throttling)
