@@ -1,4 +1,4 @@
 [submodule "lastz"]
 	path = lastz
 	url = git@github.com:shivsundram/lastz.git
-	branch = stage-timing
+	branch = stage-timing+rdtsc-substages

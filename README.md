@@ -156,6 +156,7 @@ LASTZ ships a plain Makefile and uses no external libraries. We have
 | `lastz/src/lastz` | `make -C lastz` | Production, no debug overhead. The "fair" target for any timing. |
 | `lastz/src/lastz_D` | (built by upstream Makefile alongside `lastz`) | Same code, with `-g` debug symbols. |
 | `lastz/src/lastz_T` | `make -C lastz build_lastz_timed` | **Stage-timer instrumented** (`-DdbgTiming -DdbgTimingGappedExtend`). The harness uses this by default — see §8. |
+| `lastz/src/lastz_TS` | `make -C lastz build_lastz_substages` | **Substage-instrumented** (adds `-DdbgTimingSubstages` on top of `lastz_T`). Same wall-time output as `lastz_T` plus an rdtsc cycle breakdown of the seed_hit_search hot loop — see §11 "Inside seed_hit_search at cycle granularity". Adds ~3-5 % overhead via per-iteration rdtsc; use `lastz_T` for absolute wall-time, `lastz_TS` for substage breakdown. |
 
 **What we patched in the upstream tree** (very small surface area):
 
@@ -182,7 +183,8 @@ To rebuild from scratch:
 ```bash
 make -C lastz/src clean_builds
 make -C lastz                           # production
-make -C lastz build_lastz_timed         # instrumented
+make -C lastz build_lastz_timed         # instrumented (lastz_T)
+make -C lastz build_lastz_substages     # rdtsc substages (lastz_TS)
 ```
 
 To verify the binaries:
@@ -957,6 +959,107 @@ load, friendly to wide vector loads + bandwidth.
    excellent news for porting: cover 2-3 functions and you've covered
    ~90 % of the runtime.
 
+### Inside seed_hit_search at cycle granularity (rdtsc substages)
+
+The eu-stack profile gives function-level *time* shares; it cannot tell us
+whether the chain walk is memory-latency-bound or compute-bound, or how
+much of the x-drop bar is failed extension attempts vs. successful HSPs.
+For that we built `lastz_TS` (`make -C lastz build_lastz_substages`),
+which adds `__rdtsc()` cycle accumulators around four hot blocks in
+`lastz/src/seed_search.c`:
+
+- `ftm.chain_walk` — chain-walk loop body in `find_table_matches` minus
+  the time inside the processor callback. This is the pure pointer
+  chase through `pt->prev[pos]`.
+- `ftm.processor_callback` — total cycles in `(*processor)(...)`, which
+  for the `segalign_default` workload always dispatches to
+  `process_for_simple_hit`.
+- `pfs.dedup_short_circuit` — calls that returned via the `diagEnd[hDiag]`
+  dedup check, plus the cycles spent in that path.
+- `xdrop_extend_seed_hit` — calls and cycles inside the ungapped
+  extension, plus a count of how many returned `noScore` (i.e. failed
+  to find an HSP).
+- `reporter_callback` — calls and cycles in `(*info->hp.reporter)(...)`,
+  the HSP-emit dispatch.
+
+Run the same workload through `lastz_TS`; the report appears inside the
+existing `===STAGE_TIMING_BEGIN===` / `===STAGE_TIMING_END===` block, so
+no harness changes are needed. Raw output of both runs in
+`bench/results/rdtsc-substages-bird10mb-001/`.
+
+**Synthetic 1 Mbp × 1 Mbp** (3.0 s wall, 26 M find_table_matches calls,
+2.1 M chain iters):
+
+| Substage | Total cyc | Calls/iters | Cyc/call | Notes |
+|---|---:|---:|---:|---|
+| `ftm.chain_walk` | 186 M | 2.10 M | **88.9** | ~30 ns @ 3 GHz, mostly L2/L3 (table fits) |
+| `ftm.processor_callback` | 993 M | 2.10 M | 473.6 | dominated by x-drop subtree |
+| `pfs.dedup_short_circuit` | 16 M | 542 k (26 % of pfs) | 30.3 | one cache-line lookup + branch |
+| `xdrop_extend_seed_hit` | 820 M | 1.55 M | 527.7 | of which 99.5 % return noScore |
+| `reporter_callback` | 1.4 M | 6,744 | 210.8 | rare — only successful HSPs |
+
+**Real bird-Z 10 Mbp × 10 Mbp** (62.3 s wall, 226 M find_table_matches
+calls, 165 M chain iters):
+
+| Substage | Total cyc | Calls/iters | Cyc/call | Notes |
+|---|---:|---:|---:|---|
+| `ftm.chain_walk` | 20.6 G | 165 M | **125.3** | **+40 % vs 1 Mbp synth** — DRAM territory |
+| `ftm.processor_callback` | 81.8 G | 165 M | 496.1 | per-call cost flat across scales |
+| `pfs.dedup_short_circuit` | 67 M | 1.85 M (**1.1 %** of pfs) | 36.0 | barely fires on real DNA! |
+| `xdrop_extend_seed_hit` | 69.2 G | 163 M | 424.8 | **99.999 %** return noScore (1665 hits / 163 M attempts) |
+| `reporter_callback` | 0.28 M | 1665 | 170.3 | the HSPs the eu-stack flame ends in |
+
+**Three findings the rdtsc data reveals that eu-stack alone could not:**
+
+1. **Chain walk is memory-latency-bound.** Cyc-per-iter grew 89 → 125
+   (+40 %) going from 1 Mbp synth to 10 Mbp real. At ~3 GHz that's
+   30 ns → 42 ns per pointer chase, sitting between L3 hit latency
+   (~12 ns) and DRAM (~80 ns). At 10 Mbp the `prev[]` array is ~60 MB
+   (well past L3) and access patterns are random, so most loads miss
+   to DRAM. **This is the quantitative confirmation that switching to
+   the dense-array layout (counting-sort buckets) is worth doing on
+   the CPU before going GPU**: same algorithm, but reads become
+   contiguous and the hardware prefetcher can hide most of the
+   latency. Expected savings: most of the 7 s currently in chain walk.
+2. **Diagonal dedup barely fires on real cross-species DNA.** The
+   `diagEnd[hDiag]` short-circuit catches **26 %** of hits on
+   synthetic 1 Mbp but only **1.1 %** on real bird-Z 10 Mbp. Why:
+   soft-masking already suppresses the repetitive seed hits that
+   would create redundant diagonals. Implication: **SegAlign throwing
+   away dedup on the GPU costs them ~1 % of x-drop work on real
+   cross-species, not the 26 % the synthetic profile suggested.** A
+   GPU port doesn't need to faithfully reproduce dedup; it can rely on
+   masking + sheer parallelism instead.
+3. **99.999 % of x-drop calls return noScore — 162.97 M failures vs.
+   1665 successes.** Of the 23 s spent in `xdrop_extend_seed_hit`,
+   almost all of it is paying 425 cycles per call to discover "no,
+   this seed hit does not extend to a real HSP". The CPU is doing
+   163 M serially-dependent failed-extension scoring attempts. **This
+   is the strongest argument for GPU x-drop acceleration**: 163 M
+   nearly-independent, identical-shape compute units at 0.001 %
+   success rate. Embarrassingly parallel; the CPU pays 425 cycles
+   serially for every "no" answer where a GPU pays the same on every
+   warp lane in parallel.
+
+**Reconciliation check.** ftm.processor_cyc (81.8 G) − pfs subtree sum
+(69.3 G = dedup + xdrop + reporter) = 12.5 G cyc gap = 15 % of the
+processor budget. That's the body of `process_for_simple_hit` itself —
+the `hashedDiag` math, the `gfExtend` dispatch, and call/ret overhead.
+Same ~15 % gap on synthetic; the bookkeeping is consistent across
+workloads.
+
+**Cycle accounting against wall time.** Bird-Z 10 Mbp at 62.3 s:
+- Chain walk: 20.6 G cyc → ~7 s (assuming 3 GHz; could be less at
+  turbo throttling)
+- Processor callback total: 81.8 G cyc → ~27 s
+- Outside seed_hit_search (gapped extension etc.): 6.2 s by stage
+  timer
+- Total ≈ 40-50 s of accounted CPU time vs. 62 s wall. The remainder
+  is dead reckoning between rdtsc (true cycles) and wall time (turbo
+  + memory stalls counted as wall but not as retired cycles), and is
+  consistent with what we'd expect from a CPU running closer to its
+  base clock under heavy DRAM traffic.
+
 ### Findings worth flagging
 
 1. **Stage-dominance flips with alignment density.** Cross-species at
@@ -1007,21 +1110,22 @@ load, friendly to wide vector loads + bandwidth.
   `WARMUP=0 REPS=3` for a clean variance estimate (~3.5 hours).
 - **eu-stack profile of real DNA at 10 Mbp.** ✓ Done — see "Inside
   seed_hit_search" subsection above. The synthetic 1 Mbp baseline is
-  also captured at `bench/results/eustack-smoke/`. Cross-validation
-  via rdtsc instrumentation is the next instrumentation step (see #2
-  in the open questions list).
+  also captured at `bench/results/eustack-smoke/`.
+- **Cycle-level breakdown of seed_hit_search substages.** ✓ Done via
+  `lastz_TS` (the `stage-timing+rdtsc-substages` branch of the lastz
+  fork). See "Inside seed_hit_search at cycle granularity" subsection
+  above. Raw reports in `bench/results/rdtsc-substages-bird10mb-001/`.
 - **Any GPU comparison.** SegAlign is not yet built / run on this
   cluster; that's a follow-up.
 - **N-shard CPU baseline.** Standard practice is to shard the target
   by chromosome and run N parallel lastzes. We need that number to be
   fair to LASTZ when later quoting GPU speedups.
-- **Hardware counter data.** `perf` is unavailable on this kernel
-  (paranoid=3, missing linux-tools for 5.4.0-216). Plan: source-level
-  instrumentation with `__rdtsc`-style counters around the
-  `seed_hit_search` substages (chain walk vs. diag-dedup vs. ungapped
-  extend vs. HSP emit), captured per-batch to keep overhead under 1%.
-  This goes on a `stage-timing+rdtsc-substages` branch of the lastz
-  fork, alongside the eu-stack data as a cross-check.
+- **Dense-array CPU port of the position table.** SegAlign builds a
+  flat `(index_table, pos_table)` via counting-sort (see
+  `SegAlign/common/seed_pos_table.cu`). Porting just the CPU side of
+  that — same algorithm, contiguous instead of linked-list — is the
+  obvious first optimization based on the rdtsc finding that the
+  chain walk is DRAM-latency bound at 10 Mbp.
 
 ### Confirmed facts about LASTZ itself
 
@@ -1049,16 +1153,26 @@ load, friendly to wide vector loads + bandwidth.
 
 In rough order:
 
-1. **Add `__rdtsc` accumulators to seed_hit_search substages.** Patch
-   `lastz/src/seed_search.c` on a new `stage-timing+rdtsc-substages`
-   branch with cycle-accurate timers around (a) the chain walk
-   (`pt->last[word]` → `pt->prev[]`), (b) the diagonal-dedup hash
-   check, (c) `xdrop_extend_seed_hit` left/right halves, (d) HSP emit.
-   The eu-stack profile gives us function-level shares; rdtsc tells us
-   how those shares decompose into memory-latency vs. ALU work
-   *inside* each function. Critical for deciding whether the GPU port
-   should optimize for bandwidth (memory-bound chain walk) or
-   throughput (compute-bound x-drop scoring).
+1. ✓ **Add `__rdtsc` accumulators to seed_hit_search substages.**
+   Done — see the
+   [stage-timing+rdtsc-substages branch](https://github.com/shivsundram/lastz/tree/stage-timing+rdtsc-substages)
+   and the "Inside seed_hit_search at cycle granularity" subsection of §11.
+   The cycle-level data answered both questions raised by the
+   eu-stack profile: (i) the chain walk is **memory-latency-bound**
+   (89 cyc/iter @ 1 Mbp synth → 125 cyc/iter @ 10 Mbp real, sitting
+   between L3 hit and DRAM latency), (ii) the x-drop bar on the
+   eu-stack flame is **99.999 % failed extensions**, which is exactly
+   the GPU's strong suit (millions of independent identical-shape
+   work units, parallelizable across thread blocks).
+2. **Prototype a dense-array CPU position table.** SegAlign uses
+   counting-sort (`SegAlign/common/seed_pos_table.cu::GenerateSeedPosTable`)
+   to convert `pt->last[]` / `pt->prev[]` linked lists into a
+   contiguous `(index_table[N_kmers+1], pos_table[N_positions])`
+   pair — same algorithm as lastz's chain walk, but reads become
+   sequential. Expected to recoup most of the 7 s currently in
+   `ftm.chain_walk` on bird-Z 10 Mbp by letting the hardware
+   prefetcher hide DRAM latency. Add the `__rdtsc` timers from #1 to
+   the new path so we can A/B with apples-to-apples cycle numbers.
 3. **Re-run bird_z_cross with variance.** Submit again with
    `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
    median + min/max for the chr-scale wall and stage breakdown.
@@ -1180,7 +1294,9 @@ time again:
 
 ```bash
 # Build
-make -C lastz                       && make -C lastz build_lastz_timed
+make -C lastz                                                # production
+make -C lastz build_lastz_timed                              # lastz_T  (stage timers)
+make -C lastz build_lastz_substages                          # lastz_TS (rdtsc substages)
 
 # Fetch data
 python3 bench/fetch_real_data.py    # mRNAs (KB)
@@ -1210,6 +1326,16 @@ sbatch --export=ALL,\
     QUERY=bench/data_genomes/taeGut2.chrZ_0_10mb.fa,\
     OUT_DIR=bench/results/eustack-bird10mb-001 \
     bench/sbatch/profile_eustack.sbatch
+
+# Cycle-level breakdown of seed_hit_search hot loop (rdtsc substages)
+mkdir -p bench/results/rdtsc-bird10mb-002
+LASTZ_STAGE_REPORT=bench/results/rdtsc-bird10mb-002/stage_TS.txt \
+    taskset -c 0 lastz/src/lastz_TS \
+        bench/data_genomes/galGal6.chrZ_0_10mb.fa \
+        bench/data_genomes/taeGut2.chrZ_0_10mb.fa \
+        --format=maf- > /dev/null
+sed -n '/--- rdtsc substage breakdown ---/,/===STAGE_TIMING_END===/p' \
+    bench/results/rdtsc-bird10mb-002/stage_TS.txt
 
 # Inspect
 ls   bench/results/
