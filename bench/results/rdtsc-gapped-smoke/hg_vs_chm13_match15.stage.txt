@@ -1,0 +1,45 @@
+===STAGE_TIMING_BEGIN===
+total run time:            21.383
+sequence 1 I/O:            0.214
+seed position table:       0.380
+sequence 2 I/O:            0.199
+seed hit search:           0.486
+chaining:                  0.000
+gapped extension:          20.031
+interpolation:             0.000
+output:                    0.069
+total query time:          20.787
+queries:                   1
+per query (with I/O):      20.787 (0.0 per second)
+per query (w/o input):     20.589 (0.0 per second)
+total time in above_below(): 0.003
+total time in left_right(): 0.049
+total time in ydrop_align(): 19.905
+    ydrop_one_sided_align(): 19.904
+    update_lr_bounds():    0.262
+    next_sweep_seg():      0.001
+    prev_sweep_seg():      0.002
+    update_active_segs():  0.908
+    filter_active_segs():  0.294
+--- rdtsc substage breakdown ---
+substage                                 total_cycles          calls/iters         cyc/call
+ftm.chain_walk                                      0                    0              0.0
+ftm.processor_callback                              0                    0              0.0
+ftm.calls                                           0                    0                -
+pfs.calls_total                                     0               218955                -
+pfs.dedup_short_circuit                      32960354               192389            171.3
+xdrop_extend_seed_hit                        33291626                26566           1253.2
+  └─ xdrop.no_score_returns                     0                11719                -
+reporter_callback                             1870014                14847            126.0
+# pfs subtree total: 68121994 cyc  (vs ftm.processor_cyc: 0, delta = -68121994 due to pfs body itself + dispatch)
+--- rdtsc gapped_extend breakdown ---
+substage                                 total_cycles          calls/iters         cyc/call
+yda.calls                                           -                 1888                -
+yda.setup                                     7288338                 1888           3860.3
+yda.row_bounds                             3906052726             12997034            300.5
+yda.inner_dp_cells                        40431222384           4655843774              8.7
+yda.row_trailing                            312641816             12997034             24.1
+yda.traceback                               361589302             11447458             31.6
+yda.cleanup                                   1119844                 1888            593.1
+# total accounted: 45019914410 cyc; inner_dp_cells share = 89.8%
+===STAGE_TIMING_END===

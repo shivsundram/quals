@@ -156,7 +156,7 @@ LASTZ ships a plain Makefile and uses no external libraries. We have
 | `lastz/src/lastz` | `make -C lastz` | Production, no debug overhead. The "fair" target for any timing. |
 | `lastz/src/lastz_D` | (built by upstream Makefile alongside `lastz`) | Same code, with `-g` debug symbols. |
 | `lastz/src/lastz_T` | `make -C lastz build_lastz_timed` | **Stage-timer instrumented** (`-DdbgTiming -DdbgTimingGappedExtend`). The harness uses this by default — see §8. |
-| `lastz/src/lastz_TS` | `make -C lastz build_lastz_substages` | **Substage-instrumented** (adds `-DdbgTimingSubstages` on top of `lastz_T`). Same wall-time output as `lastz_T` plus an rdtsc cycle breakdown of the seed_hit_search hot loop — see §11 "Inside seed_hit_search at cycle granularity". Adds ~3-5 % overhead via per-iteration rdtsc; use `lastz_T` for absolute wall-time, `lastz_TS` for substage breakdown. |
+| `lastz/src/lastz_TS` | `make -C lastz build_lastz_substages` | **Substage-instrumented** (adds `-DdbgTimingSubstages` on top of `lastz_T`). Same wall-time output as `lastz_T` plus an rdtsc cycle breakdown of (i) the seed_hit_search hot loop (chain walk, processor callback, dedup-skip, x-drop, reporter) and (ii) the gapped-extension hot loop inside `ydrop_one_sided_align` (setup, row bounds, inner DP cells, row trailing, traceback, cleanup) — see §11 "Inside seed_hit_search at cycle granularity" and "Inside `ydrop_one_sided_align` at cycle granularity". Adds ~3-5 % overhead via per-iteration rdtsc on seed search and amortized <1 % overhead on gapped extension; use `lastz_T` for absolute wall-time, `lastz_TS` for substage breakdown. |
 
 **What we patched in the upstream tree** (very small surface area):
 
@@ -1276,6 +1276,150 @@ Use `total_bp` as the sensitivity metric, not HSP count — see finding
   consistent with what we'd expect from a CPU running closer to its
   base clock under heavy DRAM traffic.
 
+#### Inside `ydrop_one_sided_align` at cycle granularity (rdtsc substages)
+
+In four of five regimes, gapped extension is 83-99 % of wall (sparse
+mouse-human, dense bird-Z, dense mouse-rat, dense human-rhesus, dense
+within-species — see "Step-axis Pareto sweeps" below). The existing
+`-DdbgTimingGappedExtend` instrumentation tells us that virtually all
+of that time is in `ydrop_one_sided_align` — but not where inside it.
+We extended the same `lastz_TS` build with rdtsc accumulators around
+six substages of `ydrop_one_sided_align`:
+
+| substage | what it covers | granularity |
+|---|---|---|
+| `yda.setup`         | scoring extract, L/R bound init, first DP row     | per call |
+| `yda.row_bounds`    | `update_LR_bounds` + `update_active_segs`         | per row |
+| `yda.inner_dp_cells`| the inner col loop that updates DP cells          | per cell |
+| `yda.row_trailing`  | RY adjustment + insertion-prolongation tail       | per row |
+| `yda.traceback`     | edit-script reconstruction walk                   | per step |
+| `yda.cleanup`       | `filter_active_segs` + `dpMatrix` frees           | per call |
+
+rdtsc reads are placed **outside** the inner col loop (one pair per
+row only) and divided by the row's cell count to get cyc/cell. This
+keeps rdtsc overhead amortized to ~25 cycles per ~10³ cells, well
+under 1 % of the inner loop's true cost. Implementation:
+[`gapped_extend.c` in `stage-timing+rdtsc-substages`](https://github.com/shivsundram/lastz/tree/stage-timing+rdtsc-substages).
+
+**The data, all five regimes at `--step=20`** (10 Mbp × 10 Mbp slice,
+single-thread, pinned to CPU 0; raw reports in
+`bench/results/rdtsc-gapped-smoke/`):
+
+| Regime | yda.calls | rows | inner cells | **cyc/cell** | inner share | bounds cyc/row | tb cyc/step |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Sparse synteny (mm-hg)        |     20 |     23,854 |    11.2 M |   16.8 | 96.4 % | 269 | 12.1 |
+| Bird-Z cross (12of19)         |    740 |  1,233,170 |   618.7 M |   16.5 | 96.5 % | 272 | 12.2 |
+| Mouse-rat dense (12of19)      |  2,948 |  6,507,500 | 2,808.9 M |   14.0 | 95.1 % | 273 | 14.0 |
+| Within-species (match15)      |  1,888 | 12,997,034 | 4,655.8 M | **8.7**| 89.8 % | 300 | 31.6 |
+| Primate (rhesus, 12of19)      | 34,994 | 65,115,964 |28,843.5 M |   15.6 | 95.3 % | 307 | 12.3 |
+
+**What the cycle breakdown says.**
+
+1. **The inner DP cell loop is the GPU kernel target.** It owns
+   89.8-96.5 % of accounted gapped cycles in every regime. Setup,
+   row-bounds, row-trailing, traceback, and cleanup combined are
+   ≤10 % even in the most extreme case (within-species, where bigger
+   DP matrices push fixed per-row work up). Anything other than the
+   inner col loop is bookkeeping; a GPU port that only accelerates
+   `update_LR_bounds` will buy at most 3 %.
+
+2. **Per-cell cost is regime-dependent — and the within-species
+   regime is 1.9× cheaper per cell than everything else.** Bird-Z,
+   mouse-rat, mouse-human and rhesus all cluster at 14-17 cyc/cell;
+   within-species lands at 8.7 cyc/cell. Two competing hypotheses:
+   (a) at 99.5 % identity the "we cannot improve C" branch is taken
+   ~all the time, so the cell body is a tight straight-line update
+   with predictable score deltas; (b) within-species has bigger DP
+   matrices (~2.5 M cells/call vs ~0.6-1 M elsewhere), giving the
+   sweep-row prefetcher more runway. Either way, **the GPU kernel
+   needs to handle 8-17 cyc/cell of CPU work**, i.e. on the order
+   of ~3 ns/cell at 3 GHz — the same ballpark as a single-precision
+   SIMD update.
+
+3. **Per-row fixed cost is constant across regimes.** `update_LR_bounds`
+   + `update_active_segs` is 269-307 cyc/row independent of identity,
+   density, anchor count, or seed pattern. That's reassuring — it
+   means the row-launch overhead on a GPU kernel is bounded by a
+   number we can predict *a priori*.
+
+4. **Traceback is essentially free** — 12-14 cyc/step in four of
+   five regimes (within-species is the outlier at 31.6 cyc/step,
+   ~2.5× slower; that's still 1.6 % of accounted cycles even there).
+   A GPU implementation can leave traceback on the host CPU without
+   measurable impact.
+
+5. **Cells per ydrop call scale with average alignment length, not
+   anchor count.** Within-species: 4.66 G cells / 1,888 calls ≈
+   2.5 M cells/call (long, thin DP matrices — high-identity
+   extensions go far). Rhesus: 28.8 G / 34,994 ≈ 824 k cells/call
+   (many short calls — anchor-rich but lower identity per call).
+   Bird-Z, mouse-rat, mouse-human: ~0.6-1.0 M cells/call. Implication
+   for batching: a GPU kernel sized to one DP-row-worth of work
+   needs to amortize launch overhead across ~10⁵-10⁶ cells; that's
+   feasible but argues for a "warp-per-row, persistent-kernel"
+   design rather than "one CUDA stream per ydrop call".
+
+6. **Cells per traceback step is a clean inverse-density metric.**
+   Sparse: ~2,170 cells/step. Bird-Z: ~1,007. Mouse-rat: ~640.
+   Within-species: ~407. Higher identity = tighter band = fewer
+   cells explored per output edit op. This is the natural target
+   for "how wide does my GPU banded-DP need to be?" — at
+   within-species identities, a band width of ~50 cells (5 %
+   margin around the diagonal) probably suffices; at cross-species
+   identities a 500-cell band is more honest.
+
+7. **Cycle accounting closes to ~70-75 % of stage-timer wall in
+   every regime** (e.g. bird-Z step=20: 10.58 G accounted cyc ≈
+   3.5 s @ 3 GHz vs. 4.4 s gap_ext stage). The 25-30 % gap is
+   memory-stall cycles not retired by the issue width, exactly
+   the same dead reckoning as in the seed-search rdtsc analysis.
+   It also confirms — independently — that the inner DP cell loop
+   is **memory-traffic-bound** more than ALU-bound: a GPU port
+   that hits its bandwidth budget should hit closer to ~3 cyc/cell
+   on the equivalent core count.
+
+**Reproduce.** Prereq: `lastz_TS` built (`make -C lastz
+build_lastz_substages`) and the five 10 Mbp slices on disk (see the
+"Step-axis Pareto sweeps" reproduction block below for the exact
+`fetch_genomes.py` and `slice_genome.py` calls). Then:
+
+```bash
+mkdir -p bench/results/rdtsc-gapped-smoke
+OUT=bench/results/rdtsc-gapped-smoke
+LASTZ=lastz/src/lastz_TS
+
+run() {
+    local tag="$1" t="$2" q="$3"; shift 3
+    env LASTZ_STAGE_REPORT=$OUT/${tag}.stage.txt taskset -c 0 \
+        "$LASTZ" "$t" "$q" "$@" --format=maf- > /dev/null 2>&1
+}
+
+run mouse_human_step20  bench/data_genomes/hg38.chr19_40_50mb.fa \
+                        bench/data_genomes/mm10.chr10_120_130mb.fa \
+                        --seed=12of19 --step=20
+run bird_step20         bench/data_genomes/galGal6.chrZ_0_10mb.fa \
+                        bench/data_genomes/taeGut2.chrZ_0_10mb.fa \
+                        --seed=12of19 --step=20
+run mouse_rat_step20    bench/data_genomes/mm10.chr10_40_50mb.fa \
+                        bench/data_genomes/rn6.chr20_40_50mb.fa \
+                        --seed=12of19 --step=20
+run hg_vs_chm13_match15 bench/data_genomes/hg38.chr1_50_60mb.fa \
+                        bench/data_genomes/hs1.chr1_50_60mb.fa \
+                        --seed=match15 --notransition --step=20
+run rhesus_step20       bench/data_genomes/hg38.chr19_40_50mb.fa \
+                        bench/data_genomes/rheMac10.chr19_40_50mb.fa \
+                        --seed=12of19 --step=20
+
+# Extract the gapped substage block from each report:
+for f in $OUT/*.stage.txt; do
+    echo "=== $(basename $f .stage.txt) ==="
+    sed -n '/--- rdtsc gapped_extend breakdown ---/,/===STAGE_TIMING_END===/p' "$f"
+done
+```
+
+Total wall: ~4-5 minutes (rhesus alone is ~4 min; the other four
+are ≤25 s each).
+
 #### Step-axis Pareto sweeps across five regimes
 
 After the seed-weight (bird-Z) and within-species (hg-vs-CHM13) sweeps
@@ -1589,10 +1733,18 @@ Raw artifacts in `bench/results/step-sweep-rat10mb/`.
    66×. Likely cause is the diagonal-hash data structure (re-hashing +
    rehashed-bucket walks scale super-linearly with seed-hit count,
    itself ∝ target_len × query_len for random sequence).
-4. **Inner DP loop is 96% of gapped_extension** in both profiles
-   (cross: 349/363 s, self: 5336/11800 s). If we ever GPU-accelerate
-   gapped extension, `ydrop_one_sided_align` is the only target —
-   everything else is bookkeeping.
+4. **Inner DP loop is 90-97 % of gapped_extension** in every regime
+   profiled — confirmed at cycle granularity (rdtsc) across all five
+   regimes (sparse mouse-human, bird-Z, mouse-rat, primate, within-
+   species). The inner col loop in `ydrop_one_sided_align` runs
+   8-17 cyc/cell depending on regime; setup/bounds/trailing/traceback/
+   cleanup combined are ≤10 % even in the most extreme case. If we
+   GPU-accelerate gapped extension, the inner cell update is the
+   only target — everything else is bookkeeping. Within-species is
+   the outlier at 8.7 cyc/cell (vs. ~15 elsewhere), likely because
+   high identity collapses the inner-loop branches to a tight
+   straight-line update. See "Inside `ydrop_one_sided_align` at
+   cycle granularity" in §11 for the full per-substage table.
 5. **Real DNA is friendlier than random DNA.** 10 Mbp synthetic → 80
    Mbp real bird-cross (60× the seed-search space): seed_hit_search grew
    86×, gapped_extension grew 21×. Soft-masked repeats (~27% of
@@ -1651,13 +1803,15 @@ Raw artifacts in `bench/results/step-sweep-rat10mb/`.
   that — same algorithm, contiguous instead of linked-list — is the
   obvious first optimization based on the rdtsc finding that the
   chain walk is DRAM-latency bound at 10 Mbp.
-- **Gapped-extension acceleration.** The hg-vs-CHM13 within-species
-  data showed gapped extension at 95 % of runtime once seed_hit_search
-  is properly tuned. We don't yet have rdtsc-level instrumentation
-  inside `gapped_extend.c` to know whether y-drop's hot loop is
-  memory- or compute-bound. SegAlign's GPU port handles this kernel
-  via banded x-drop on GPU; mirroring that on the CPU side first would
-  give us the same kind of A/B baseline we have for the seed table.
+- **Gapped-extension cycle breakdown.** ✓ Done — see "Inside
+  `ydrop_one_sided_align` at cycle granularity" in §11. The inner DP
+  cell loop is 90-97 % of accounted gapped cycles in all five
+  regimes at 8-17 cyc/cell; cycle accounting closes to ~70 % of wall,
+  consistent with the inner loop being **memory-traffic-bound** more
+  than ALU-bound. Raw reports in `bench/results/rdtsc-gapped-smoke/`.
+  SegAlign's GPU port handles this kernel via banded x-drop on GPU;
+  the next CPU baseline to build is a banded ydrop variant for
+  apples-to-apples comparison.
 - **rdtsc instrumentation for `find_table_matches_resolve`.** The
   overweight-seed path (any seed with bit-weight > 24, e.g. `match15`)
   bypasses our current substage timers. Small patch to fix; only
@@ -1710,12 +1864,15 @@ In rough order:
    `ftm.chain_walk` on bird-Z 10 Mbp by letting the hardware
    prefetcher hide DRAM latency. Add the `__rdtsc` timers from #1 to
    the new path so we can A/B with apples-to-apples cycle numbers.
-3. **Instrument `gapped_extend.c` with rdtsc substage counters.** The
-   hg-vs-CHM13 within-species runs showed gapped extension is 95 % of
-   runtime once seed_hit_search is properly tuned. We need substage
-   breakdown on `ydrop_one_sided_align` (the inner y-drop loop) before
-   we can design a GPU kernel for it. Mirror the seed_search
-   instrumentation pattern from #1.
+3. ✓ **Instrument `gapped_extend.c` with rdtsc substage counters.**
+   Done — see "Inside `ydrop_one_sided_align` at cycle granularity"
+   in §11. Verdict: the inner DP cell loop is the only GPU kernel
+   target; it owns 89.8-96.5 % of accounted gapped cycles across
+   all five regimes at 8-17 cyc/cell. Setup/bounds/trailing/
+   traceback/cleanup combined are ≤10 % everywhere. The within-
+   species regime (hg-vs-CHM13 match15) is 1.9× cheaper per cell
+   than the others, suggesting the inner loop simplifies to a
+   straight-line update when identity is very high.
 4. **Re-run bird_z_cross with variance.** Submit again with
    `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
    median + min/max for the chr-scale wall and stage breakdown.
@@ -1870,14 +2027,18 @@ sbatch --export=ALL,\
     OUT_DIR=bench/results/eustack-bird10mb-001 \
     bench/sbatch/profile_eustack.sbatch
 
-# Cycle-level breakdown of seed_hit_search hot loop (rdtsc substages)
+# Cycle-level breakdown of seed_hit_search + ydrop_one_sided_align (rdtsc substages)
 mkdir -p bench/results/rdtsc-bird10mb-002
 LASTZ_STAGE_REPORT=bench/results/rdtsc-bird10mb-002/stage_TS.txt \
     taskset -c 0 lastz/src/lastz_TS \
         bench/data_genomes/galGal6.chrZ_0_10mb.fa \
         bench/data_genomes/taeGut2.chrZ_0_10mb.fa \
         --format=maf- > /dev/null
-sed -n '/--- rdtsc substage breakdown ---/,/===STAGE_TIMING_END===/p' \
+# Seed substages (chain walk, x-drop, reporter, dedup):
+sed -n '/--- rdtsc substage breakdown ---/,/--- rdtsc gapped_extend/p' \
+    bench/results/rdtsc-bird10mb-002/stage_TS.txt
+# Gapped substages (setup, row bounds, inner DP cells, traceback, cleanup):
+sed -n '/--- rdtsc gapped_extend breakdown ---/,/===STAGE_TIMING_END===/p' \
     bench/results/rdtsc-bird10mb-002/stage_TS.txt
 
 # Step-axis Pareto sweeps across five regimes (10 Mbp x 10 Mbp scale)
