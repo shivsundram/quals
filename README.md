@@ -1276,10 +1276,10 @@ Use `total_bp` as the sensitivity metric, not HSP count — see finding
   consistent with what we'd expect from a CPU running closer to its
   base clock under heavy DRAM traffic.
 
-#### Step-axis Pareto sweeps across four regimes
+#### Step-axis Pareto sweeps across five regimes
 
 After the seed-weight (bird-Z) and within-species (hg-vs-CHM13) sweeps
-above, we ran four `--step` sweeps at the same 10 Mbp × 10 Mbp scale to
+above, we ran five `--step` sweeps at the same 10 Mbp × 10 Mbp scale to
 map how the seed-vs-gapped balance moves across phylogenetic distance.
 Three findings collapse out:
 
@@ -1287,27 +1287,63 @@ Three findings collapse out:
    well before 93 % identity.
 2. The bottleneck axis is *alignable density*, not identity. Identity
    only matters because it shapes density.
-3. For three of four regimes, gapped extension is 95–99 % of wall —
+3. For three of five regimes, gapped extension is 83–99 % of wall —
    so the GPU-acceleration target is `ydrop_one_sided_align`, not the
-   seed kernel, on anything closer than ~80 % identity.
+   seed kernel, on anything closer than ~85 % identity *with dense
+   synteny*.
 
 Single-thread runs pinned to CPU 0, `lastz_TS` build (so we get
 per-stage timing), `--seed=12of19` everywhere except the within-species
 column (where `--seed=match15 --notransition` is the appropriate
 recipe).
 
+##### All step-sweep data, in one place
+
+Master table — every step-sweep data point we have, side-by-side, at the
+same 10 Mbp × 10 Mbp scale. Identity rises top-to-bottom; alignable
+density also rises top-to-bottom, *but not monotonically* (the sparse-
+synteny mouse-human row sits above bird-Z in identity but far below it
+in density).
+
+| Regime | Slice | Identity | step | Wall | seed_hit | gap_ext | HSPs | bp aligned |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Sparse synteny | hg.chr19[40-50] × mm.chr10[120-130] | ~80 % | 1 | 18.4 s | 17.5 s **(95 %)** | 0.15 s (1 %) | 15 | 6.3 kbp |
+|  |  |  | 20 | 3.4 s | 3.0 s (87 %) | 0.10 s (3 %) | 10 | 4.9 kbp |
+|  |  |  | 100 | 2.5 s | 2.1 s (84 %) | 0.08 s (3 %) | 6 | 4.5 kbp |
+| Cross-species (bird-Z) | galGal6.chrZ × taeGut2.chrZ [0-10] | ~75 % | 1 | 62.3 s | 55.2 s **(89 %)** | 6.2 s (10 %) | 510 | 0.61 Mbp |
+|  |  |  | 20 | 11.8 s | 6.3 s (54 %) | 4.9 s (42 %) | 370 | 0.54 Mbp |
+|  |  |  | 100 | 7.2 s | 3.8 s (53 %) | 3.1 s (43 %) | 214 | 0.38 Mbp |
+| **Mouse-rat dense** | **mm.chr10[40-50] × rn6.chr20[40-50]** | **~85 %** | **1** | **47.3 s** | **25.6 s (54 %)** | **21.0 s (44 %)** | **1767** | **4.15 Mbp** |
+|  |  |  | **20** | **22.6 s** | **3.4 s (15 %)** | **18.9 s (83 %)** | **1462** | **4.05 Mbp** |
+|  |  |  | **100** | **17.7 s** | **2.2 s (13 %)** | **15.1 s (85 %)** | **991** | **3.77 Mbp** |
+| Primate (rhesus) | hg.chr19[40-50] × rheMac10.chr19[40-50] | ~93 % | 1 | 346.6 s | 14.3 s (4 %) | 331.2 s **(96 %)** | 28061 | 37.82 Mbp |
+|  |  |  | 20 | 221.9 s | 2.1 s (1 %) | 219.2 s **(99 %)** | 17483 | 31.23 Mbp |
+|  |  |  | 100 | 123.2 s | 1.4 s (1 %) | 121.3 s **(98 %)** | 8267 | 23.14 Mbp |
+| Within-species (match15) | hg.chr1[50-60] × hs1.chr1[50-60] | ~99.5 % | 20 | 22.3 s | 0.49 s (2 %) | 20.9 s **(94 %)** | 943 | 11.33 Mbp |
+|  |  |  | 50 | 19.1 s | 0.33 s (2 %) | 18.3 s **(96 %)** | 648 | 10.89 Mbp |
+|  |  |  | 100 | 17.5 s | 0.31 s (2 %) | 16.7 s **(96 %)** | 431 | 10.52 Mbp |
+
+The mouse-rat row is the threshold pin — at step=1 it sits at 54/44
+seed/gap (essentially balanced); by step=20 it has flipped to 15/83
+gap-dominated. See **Pinning the threshold** subsection below for the
+full sweep + within-mm-rn density gradient.
+
+##### Compact per-regime summary
+
 | Regime | Slice | Identity | bp aligned (10 Mbp²) | seed share | gap share | Wall step=1 → step=100 |
 |---|---|---:|---:|---:|---:|---:|
 | Sparse synteny | hg38.chr19[40-50M] × mm10.chr10[120-130M] | ~80 % within blocks | 0.006 Mbp | 84-95 % flat | 1-4 % flat | 18.4 s → 2.5 s |
 | Cross-species (dense) | galGal6.chrZ[0-10M] × taeGut2.chrZ[0-10M] | ~75 % | 0.61 Mbp | 89 % → 53 % | 10 % → 43 % | 62.3 s → 7.2 s |
+| Mouse-rat (dense) | mm10.chr10[40-50M] × rn6.chr20[40-50M] | ~85 % | 4.05 Mbp | 54 % → 13 % | 44 % → 85 % | 47.3 s → 17.7 s |
 | Primate (dense) | hg38.chr19[40-50M] × rheMac10.chr19[40-50M] | ~93 % | 23-38 Mbp | 1-4 % flat | 96-99 % flat | 346.6 s → 123.2 s |
 | Within-species | hg38.chr1[50-60M] × hs1.chr1[50-60M] | ~99.5 % | 11-12 Mbp | 1-2 % flat | 94-96 % flat | 22.3 s → 17.5 s (match15) |
 
 Detailed per-step numbers are committed at:
 
-- `bench/results/step-sweep-mouse10mb/` (sparse synteny)
-- `bench/results/step-sweep-bird10mb/`  (cross-species, with
+- `bench/results/step-sweep-mouse10mb/`  (sparse synteny)
+- `bench/results/step-sweep-bird10mb/`   (cross-species, with
   `seed-sweep-bird10mb/default_12of19.*` as the cached step=1 baseline)
+- `bench/results/step-sweep-rat10mb/`    (mouse-rat, threshold pin)
 - `bench/results/step-sweep-rhesus10mb/` (primate)
 - `bench/results/step-sweep-hg-vs-chm13/` (within-species)
 
