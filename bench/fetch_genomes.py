@@ -76,6 +76,12 @@ GENOMES: list[Genome] = [
            notes="Mmul_10, Feb 2019. ~93% identity with hg38 in syntenic regions; "
                  "primate sister taxon, useful as a true mid-identity regime point "
                  "between hg-vs-CHM13 (~99.5%) and bird-Z (~75%)."),
+    Genome("rn6",     "rat (Rattus norvegicus)",     2.87, "chr20",
+           notes="Rnor_6.0, Jul 2014. ~85% identity with mm10 in syntenic regions; "
+                 "rn6.chr20 is the syntenic counterpart of mm10.chr10. Useful as a "
+                 "dense-synteny / mid-identity regime point to pin down the "
+                 "seed->gapped bottleneck crossover (sits between bird-Z's 0.6 Mbp "
+                 "aligned and rhesus's 23-37 Mbp aligned per 100 Mbp^2 product)."),
     Genome("galGal6", "chicken (Gallus gallus)",      1.05, "chrZ",
            notes="Mar 2018. Bird sex chr Z; birds are ZW (males ZZ, females ZW)."),
     Genome("taeGut2", "zebra finch (Taeniopygia guttata)", 1.02, "chrZ",
