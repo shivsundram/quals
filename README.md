@@ -1431,6 +1431,110 @@ timing enabled, the same shape as `sweep_human1.sh`: pinned to CPU 0,
 fail-loudly on non-zero exit, captures `*.stage.txt` per step value,
 and prints a Pareto table at the end.
 
+#### Pinning the threshold: mouse-rat at ~85 % identity
+
+The four-regime sweep above puts the seed→gapped crossover somewhere
+between bird-Z's 0.6 Mbp aligned (seed dominates 9× at step=1) and
+rhesus's 23 Mbp aligned (gap dominates 7×). To pin it down we picked
+**mouse-rat at chr10[40-50M] × chr20[40-50M]** — ~85 % identity,
+dense synteny, alignable density chosen by probing 5 (mm.chr10 ×
+rn6.chr20) 10 Mbp pairs at `--step=100` and picking the densest.
+
+Probing the within-mouse-rat density gradient at step=100 (single
+identity tier, varying offset) walks straight through the threshold:
+
+| Slice | bp aligned (step=100) | seed_hit | gap_ext | dominator |
+|---|---:|---:|---:|---|
+| mm.chr10[ 0-10M] × rn6.chr20[ 0-10M] |   3.5 kbp | 2.23 s | 0.07 s | seed (32×) |
+| mm.chr10[10-20M] × rn6.chr20[10-20M] |   4.8 kbp | 2.46 s | 0.12 s | seed (21×) |
+| mm.chr10[20-30M] × rn6.chr20[20-30M] |  17.9 kbp | 2.44 s | 0.23 s | seed (11×) |
+| mm.chr10[30-40M] × rn6.chr20[30-40M] | 499.6 kbp | 2.04 s | 2.85 s | **transition** (gap = 1.4× seed) |
+| mm.chr10[40-50M] × rn6.chr20[40-50M] | 3,768.6 kbp | 2.24 s | 15.19 s | gap (7×) |
+
+Same identity tier, same target chromosome, same query chromosome,
+same lastz invocation — the bottleneck flips purely as a function of
+which 10 Mbp window we sample.
+
+Full step sweep on the densest slice (mm × rn at chr10/chr20 [40-50M]):
+
+| step | Wall | seed_hit | gap_ext | HSPs | bp aligned |
+|---:|---:|---:|---:|---:|---:|
+| 1   | 47.3 s | 25.6 s **(54 %)** | 21.0 s **(44 %)** | 1767 | 4.15 Mbp |
+| 20  | 22.6 s |  3.4 s ( 15 %)    | 18.9 s ( 83 %)    | 1462 | 4.05 Mbp |
+| 30  | 21.2 s |  3.0 s ( 14 %)    | 17.8 s ( 84 %)    | 1314 | 4.00 Mbp |
+| 50  | 20.0 s |  2.7 s ( 13 %)    | 17.0 s ( 85 %)    | 1180 | 3.92 Mbp |
+| 100 | 17.7 s |  2.2 s ( 13 %)    | 15.1 s ( 85 %)    |  991 | 3.77 Mbp |
+
+**Step=1 is itself at the bottleneck transition** (54 % seed / 44 %
+gap, essentially balanced), and by step=20 the bottleneck has fully
+flipped (15 % / 83 %). This is the cleanest single demonstration we
+have that the crossover is a real, narrow boundary.
+
+**Quantitative rule for "which kernel matters"** (per 100 Mbp² input
+product, summarized across all five regime points):
+
+| step value | seed = gap density (the threshold) | < threshold | > threshold |
+|---|---|---|---|
+| step=1   | ~3-4 Mbp aligned   | seed kernel only (sparse synteny, cross-species at scale) | gap kernel only (dense, within-species, primate-primate) |
+| step=20  | ~1-2 Mbp aligned   | seed kernel only | gap kernel only |
+| step=100 | ~0.3-0.5 Mbp aligned | seed kernel only | gap kernel only |
+
+The threshold is **step-dependent** because seed work shrinks faster
+than gap work as `--step` grows. At default `--step=1` the inflection
+point sits near 3-4 Mbp; at the more typical cross-species `--step=20`
+it sits near 1-2 Mbp; at aggressive `--step=100` it slides down to
+~0.3-0.5 Mbp. This means a workload that's seed-dominated at step=1
+can become gap-dominated at step=20 simply because we shrunk the
+seed budget faster than the gap budget.
+
+**Five-regime overview** (10 Mbp × 10 Mbp slices, sorted by
+alignable density):
+
+| Regime | Identity | bp aligned | seed share @ step=20 | gap share @ step=20 |
+|---|---:|---:|---:|---:|
+| Sparse synteny (hg.chr19 × mm.chr10) | ~80 % blocks | 0.005 Mbp |  87 % | 3 % |
+| Cross-species (bird-Z chrZ self) | ~75 % | 0.54 Mbp |  54 % | 42 % |
+| **Dense ~85 % (mm.chr10 × rn6.chr20 [40-50M])** | ~85 % | **4.05 Mbp** | **15 %** | **83 %** |
+| Within-species (hg.chr1 × hs1.chr1, match15) | ~99.5 % | 11.33 Mbp |  2 % | 94 % |
+| Primate-primate (hg.chr19 × rheMac10.chr19) | ~93 % | 31.23 Mbp |  1 % | 99 % |
+
+The list is sorted by density, not identity — and it makes the
+threshold visually obvious: bird-Z and "below" are seed-dominated;
+mouse-rat dense and "above" are gap-dominated. **Identity does not
+order the regimes** (rhesus at 93 % is more gap-dominated than
+within-species at 99.5 %, because primate-primate at default cross-
+species seed settings overcounts overlapping HSPs).
+
+**Reproduce.** Add `rn6` to the inventory, fetch (~720 MB, ~30 s
+download), slice the densest pair, and run the rat sweep:
+
+```bash
+# 1) Fetch rn6 (Rnor_6.0).
+python3 bench/fetch_genomes.py --only rn6
+
+# 2) Slice the dense-synteny mouse-rat pair (chr10[40,50M] / chr20[40,50M]).
+python3 bench/slice_genome.py \
+    bench/data_genomes/mm10.chr10.fa \
+    /scratch2/shiv1/lastz-bench-data/slices/mm10.chr10_40_50mb.fa \
+    --start 40000000 --length 10000000
+python3 bench/slice_genome.py \
+    bench/data_genomes/rn6.chr20.fa \
+    /scratch2/shiv1/lastz-bench-data/slices/rn6.chr20_40_50mb.fa \
+    --start 40000000 --length 10000000
+ln -sf /scratch2/shiv1/lastz-bench-data/slices/mm10.chr10_40_50mb.fa \
+    bench/data_genomes/mm10.chr10_40_50mb.fa
+ln -sf /scratch2/shiv1/lastz-bench-data/slices/rn6.chr20_40_50mb.fa \
+    bench/data_genomes/rn6.chr20_40_50mb.fa
+
+# 3) Run the sweep (~5 min, single thread).
+./step_sweep_rat.sh
+```
+
+To reproduce the within-regime density gradient probe (the "same
+identity tier, varying density" table above), iterate the same offset
+on both species at `--step=100` for a quick smoke result per slice.
+Raw artifacts in `bench/results/step-sweep-rat10mb/`.
+
 ### Findings worth flagging
 
 1. **Stage-dominance flips with alignment density.** Cross-species at
@@ -1473,19 +1577,19 @@ and prints a Pareto table at the end.
    all samples) — that's the chain walk inside `find_table_matches`
    (the `for (s = pt->last[word]; s != NULL; s = pt->prev[s-1])` loop).
 8. **The bottleneck axis is alignable density, not identity.** Step-
-   axis sweeps across four regimes (sparse-synteny mouse-human, bird-Z,
-   primate-primate, within-species — see "Step-axis Pareto sweeps"
-   subsection above) show that the seed→gapped crossover is set by
-   how much actually aligns per Mbp² of input product, not directly by
-   identity. Three of the four regimes are gapped-dominated at 95-99 %
-   of wall regardless of step value; only bird-Z (~75 % identity, ~0.6
-   Mbp aligned per 100 Mbp²) sits at the inflection point where both
-   stages matter. **At ~93 % identity (rhesus-human) the bottleneck
-   has already fully flipped to gapped extension.** SegAlign's
-   "GPU-both-stages" pitch only earns its keep on bird-Z-shaped
-   workloads; for anything closer than ~85 %, only `ydrop_one_sided_
-   align` matters — and for very-distant-species workloads (sparse
-   synteny), only the seed kernel matters.
+   axis sweeps across five regimes (sparse-synteny mouse-human, bird-Z,
+   mouse-rat dense, primate-primate, within-species — see "Step-axis
+   Pareto sweeps" and "Pinning the threshold" subsections above) show
+   that the seed→gapped crossover is set by how much actually aligns
+   per Mbp² of input product, not directly by identity. The mouse-rat
+   sweep at ~85 % identity / dense synteny pinned the threshold:
+   **at default `--step=20` the seed-share = gap-share crossover sits
+   at ~1-2 Mbp aligned per 100 Mbp²**. Below that, the seed kernel
+   matters; above that, only `ydrop_one_sided_align` matters. The
+   threshold itself is step-dependent — at `--step=1` it shifts up to
+   ~3-4 Mbp, at `--step=100` it shifts down to ~0.3-0.5 Mbp. SegAlign's
+   "GPU-both-stages" pitch only earns its keep in the narrow density
+   band straddling the threshold (bird-Z is the canonical example).
 
 ### What we don't have yet
 
@@ -1740,10 +1844,11 @@ LASTZ_STAGE_REPORT=bench/results/rdtsc-bird10mb-002/stage_TS.txt \
 sed -n '/--- rdtsc substage breakdown ---/,/===STAGE_TIMING_END===/p' \
     bench/results/rdtsc-bird10mb-002/stage_TS.txt
 
-# Step-axis Pareto sweeps across four regimes (10 Mbp x 10 Mbp scale)
+# Step-axis Pareto sweeps across five regimes (10 Mbp x 10 Mbp scale)
 ./step_sweep.sh           # within-species: hg-vs-CHM13, ~75 s
 ./step_sweep_bird.sh      # cross-species: bird-Z, ~3 min
 ./step_sweep_mouse.sh     # sparse synteny: mouse-human, ~30 s
+./step_sweep_rat.sh       # threshold pin: mouse-rat ~85% dense, ~5 min
 ./step_sweep_rhesus.sh    # primate-primate (~93%): hg-vs-rhesus, ~17 min
 ./get_tradeoffs.sh        # within-species headline + bottleneck-flip table
 
