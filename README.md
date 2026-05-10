@@ -1420,6 +1420,65 @@ done
 Total wall: ~4-5 minutes (rhesus alone is ~4 min; the other four
 are ≤25 s each).
 
+#### A textbook 2-D reference for `ydrop_one_sided_align` (`ydrop_sane`)
+
+Once the inner DP cell loop is identified as the GPU kernel target, the
+next question is "what does the kernel **actually have to compute**?"
+`ydrop_one_sided_align` is hard to read directly — it interleaves five
+distinct concerns (sweep-row buffer arithmetic, traceback tape append,
+left/right-segment masking, y-drop pruning, row trailing) into one
+~250-line function. To pin down the recurrence cleanly we wrote a
+textbook 2-D Gotoh y-drop port in
+[`lastz/src/ydrop_sane.c`](lastz/src/ydrop_sane.c) that is **bit-
+identical** to lastz's `ydrop_one_sided_align` over the v0 scope (no
+neighbor-alignment masking, `trimToPeak == true`, forward extension —
+which covers every test case in the validation driver and the
+overwhelming majority of real-world calls).
+
+Differences from lastz proper:
+- Three full `(M+1) × (N+1)` matrices for `C`, `D`, `I` (instead of
+  one sweep row of `dpCell`s) and one full `(M+1) × (N+1)` link byte
+  tape (instead of a chunked `tback` byte tape with a `tbRow[]` offset
+  table). Per-call `malloc_or_die`/`free_if_valid`. No state crosses
+  calls.
+- Per-row `LY[]` / `RY[]` arrays kept explicit, no segment-driven
+  bound updates. Y-drop pruning, left-edge chain shrink (`LY++` on
+  consecutive left-side prunes), right-boundary termination (`RY++`
+  by one with a negInf sentinel), and the insertion-prolongation row
+  trailing all match lastz line-for-line.
+- `bestScore` only updates inside the `cFromC` (we-cannot-improve-C)
+  branch, matching lastz's choice to anchor the alignment endpoint at
+  a substitution rather than a gap.
+
+Validated against `ydrop_one_sided_align_for_testing` (a non-static
+trampoline added to [`gapped_extend.c`](lastz/src/gapped_extend.c) that
+constructs a minimal `alignio` and forwards to the file-static
+`ydrop_one_sided_align`; the trampoline does not affect any other
+lastz code path). The driver in
+[`bench/test_ydrop.c`](bench/test_ydrop.c) compares score, endpoint,
+and edit-script byte-by-byte across:
+- 8 hand-crafted cases: identity, single mismatch, single insertion,
+  single deletion, y-drop-firing tail, alternating mismatches with
+  high y-drop, long identity, and short no-match;
+- 200 fuzz pairs at lengths 50-1500 bp and identities 60-99 %
+  (xorshift, deterministic seed);
+- each case is run TWICE — once forward (`reversed=0` on lastz, sane
+  on `(A,B)`) and once reversed (`reversed=1` on lastz, sane on
+  `(rev(A), rev(B))`) — to cover both halves of lastz's two-sided
+  alignment.
+
+Result: **2016 / 2016 pass at FUZZ=1000** (and the default 416 / 416
+at FUZZ=200). The validated v0 includes everything that touches the
+inner DP cell loop plus its surrounding bounds/trailing logic — the
+exact code surface a GPU kernel will need to replicate. Reproduce:
+
+```bash
+make -C lastz                      # build the standard lastz objects
+make test_ydrop                    # link bench/test_ydrop against them
+./bench/test_ydrop                 # 200-case fuzz + 8 hand-crafted = 416 PASS
+FUZZ=1000 ./bench/test_ydrop       # 1000-case fuzz = 2016 PASS
+```
+
 #### Step-axis Pareto sweeps across five regimes
 
 After the seed-weight (bird-Z) and within-species (hg-vs-CHM13) sweeps
@@ -1873,6 +1932,12 @@ In rough order:
    species regime (hg-vs-CHM13 match15) is 1.9× cheaper per cell
    than the others, suggesting the inner loop simplifies to a
    straight-line update when identity is very high.
+3a. ✓ **Textbook 2-D y-drop reference (`ydrop_sane`)** validated
+   bit-identical against lastz on 2016 cases (8 hand-crafted +
+   1000 random fuzz pairs, each run forward and reversed). See
+   "A textbook 2-D reference for `ydrop_one_sided_align`" in §11.
+   This gives us a clean recurrence to GPU-port without having
+   to fight lastz's sweep-row buffer arithmetic.
 4. **Re-run bird_z_cross with variance.** Submit again with
    `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
    median + min/max for the chr-scale wall and stage breakdown.
