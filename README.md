@@ -1420,27 +1420,37 @@ done
 Total wall: ~4-5 minutes (rhesus alone is ~4 min; the other four
 are ≤25 s each).
 
-#### A textbook 2-D reference for `ydrop_one_sided_align` (`ydrop_sane`)
+#### Two textbook references for `ydrop_one_sided_align` (`ydrop_sane`)
 
 Once the inner DP cell loop is identified as the GPU kernel target, the
 next question is "what does the kernel **actually have to compute**?"
 `ydrop_one_sided_align` is hard to read directly — it interleaves five
 distinct concerns (sweep-row buffer arithmetic, traceback tape append,
 left/right-segment masking, y-drop pruning, row trailing) into one
-~250-line function. To pin down the recurrence cleanly we wrote a
-textbook 2-D Gotoh y-drop port in
-[`lastz/src/ydrop_sane.c`](lastz/src/ydrop_sane.c) that is **bit-
-identical** to lastz's `ydrop_one_sided_align` over the v0 scope (no
-neighbor-alignment masking, `trimToPeak == true`, forward extension —
-which covers every test case in the validation driver and the
-overwhelming majority of real-world calls).
+~250-line function. To pin down the recurrence cleanly we wrote
+**two** textbook ports in
+[`lastz/src/ydrop_sane.c`](lastz/src/ydrop_sane.c), both bit-identical
+to lastz over the v0 scope (no neighbor-alignment masking, `trimToPeak
+== true`, forward extension):
 
-Differences from lastz proper:
-- Three full `(M+1) × (N+1)` matrices for `C`, `D`, `I` (instead of
-  one sweep row of `dpCell`s) and one full `(M+1) × (N+1)` link byte
-  tape (instead of a chunked `tback` byte tape with a `tbRow[]` offset
-  table). Per-call `malloc_or_die`/`free_if_valid`. No state crosses
-  calls.
+1. **`ydrop_one_sided_align_impl_sane`** — the "wasteful but obvious"
+   reference: three full `(M+1) × (N+1)` score matrices for `C`, `D`,
+   `I` plus one full `(M+1) × (N+1)` link byte tape. ~13 · (M+1) · (N+1)
+   bytes per call. The clearest possible mapping from the algebraic
+   recurrences to code; intended as the reading copy when you want to
+   understand what the GPU kernel must compute.
+
+2. **`ydrop_one_sided_align_impl_sane_double_buffered`** — same
+   algorithm, lastz-matching memory profile (see "Memory layout"
+   below). Sweep-row C/D buffers, scalar I, band-compact link tape.
+   The version that participates in fair runtime A/B comparisons
+   against `ydrop_one_sided_align` (since both spend their time on
+   the actual DP work, not on initializing megabyte-scale scratch
+   arrays).
+
+Common to both:
+- Per-call `malloc_or_die`/`free_if_valid`. No state crosses calls
+  (unlike lastz's module-static `tback`/`tbRow[]`).
 - Per-row `LY[]` / `RY[]` arrays kept explicit, no segment-driven
   bound updates. Y-drop pruning, left-edge chain shrink (`LY++` on
   consecutive left-side prunes), right-boundary termination (`RY++`
@@ -1450,9 +1460,57 @@ Differences from lastz proper:
   branch, matching lastz's choice to anchor the alignment endpoint at
   a substitution rather than a gap.
 
-Validated against `ydrop_one_sided_align_for_testing` (a non-static
-trampoline added to [`gapped_extend.c`](lastz/src/gapped_extend.c) that
-constructs a minimal `alignio` and forwards to the file-static
+##### Memory layout (double-buffered variant)
+
+The `_double_buffered` variant adopts two of lastz's three memory
+tricks (see [`lastz/src/gapped_extend.c`](lastz/src/gapped_extend.c)
+note 3 and line 3775):
+
+1. **Sweep-row score buffers.** Two `(N+1)`-cell arrays each for `C`
+   and `D`, swapped between rows. `I` is a scalar carried through the
+   inner loop. Per-call score memory: **O(N)**, ~16 KB at N=1000.
+
+2. **Band-compact link tape.** A single byte tape, indexed via a per-
+   row offset table:
+
+   ```c
+   lnkRow[r] = (lnkPos at row r's start) - LY[r];
+   // Cell (r, c)'s link byte lives at lnkTape[lnkRow[r] + c]
+   ```
+
+   Only cells in the live band `[LY[r], RY[r])` consume tape bytes;
+   cells outside the band do not exist in memory. Per-call link
+   memory: **O(sum of band widths)**. For typical y-drop runs (band
+   ~500 cells), ~500 KB at M=1000, ~5 MB at M=10000.
+
+The one lastz trick we skip is the **module-static reuse** of the tape
+across calls. Lastz allocates a single 80 MB `tback` at startup,
+overwrites it from offset 0 on every ydrop call, and truncates the
+alignment if a call would overflow it. We do per-call `malloc`/`free`
+of all four allocations (score buffers, lnk tape, `lnkRow[]`, `LY/RY`)
+to keep the impl state-free. The tape grows dynamically (2× on
+overflow); `yDropTail = yDrop/gapE + 16` cells of headroom per row
+mean realloc almost never fires mid-row in practice.
+
+Side-by-side memory at M=N=2000, yDrop=910:
+
+| Impl | Score memory | Link memory | Total |
+|---|---:|---:|---:|
+| `ydrop_one_sided_align_impl_sane` (full 2-D) | 48 MB | 4 MB | 52 MB |
+| `..._double_buffered` (sweep + band) | 32 KB | ~500 KB | ~600 KB |
+| lastz `ydrop_one_sided_align` | 32 KB (per-call) | 80 MB (module-static) | same per-call as `_double_buffered` |
+
+For pathological calls (M=N=10000, no y-drop firing) the
+`_double_buffered` impl uses ~5 MB total per call, well within what
+the OS will allocate; lastz would also handle this fine (10k × 10k =
+100M cells, but the 80 MB tape would truncate the trailing portion).
+
+##### Validation
+
+Both impls are validated against `ydrop_one_sided_align_for_testing`
+(a non-static trampoline added to
+[`gapped_extend.c`](lastz/src/gapped_extend.c) that constructs a
+minimal `alignio` and forwards to the file-static
 `ydrop_one_sided_align`; the trampoline does not affect any other
 lastz code path). The driver in
 [`bench/test_ydrop.c`](bench/test_ydrop.c) compares score, endpoint,
@@ -1465,18 +1523,25 @@ and edit-script byte-by-byte across:
 - each case is run TWICE — once forward (`reversed=0` on lastz, sane
   on `(A,B)`) and once reversed (`reversed=1` on lastz, sane on
   `(rev(A), rev(B))`) — to cover both halves of lastz's two-sided
-  alignment.
+  alignment;
+- each (case, direction) pair is run against BOTH sane impls.
 
-Result: **2016 / 2016 pass at FUZZ=1000** (and the default 416 / 416
-at FUZZ=200). The validated v0 includes everything that touches the
-inner DP cell loop plus its surrounding bounds/trailing logic — the
-exact code surface a GPU kernel will need to replicate. Reproduce:
+Per case = 4 comparisons (2 impls × 2 directions). Result:
+
+- Default FUZZ=200: **832 / 832 pass** ((8 hand-crafted + 200 fuzz) × 4).
+- FUZZ=1000:        **4032 / 4032 pass** ((8 + 1000) × 4).
+- FUZZ=3000:        **12032 / 12032 pass** ((8 + 3000) × 4).
+
+The validated v0 includes everything that touches the inner DP cell
+loop plus its surrounding bounds/trailing logic — the exact code
+surface a GPU kernel will need to replicate. Reproduce:
 
 ```bash
 make -C lastz                      # build the standard lastz objects
 make test_ydrop                    # link bench/test_ydrop against them
-./bench/test_ydrop                 # 200-case fuzz + 8 hand-crafted = 416 PASS
-FUZZ=1000 ./bench/test_ydrop       # 1000-case fuzz = 2016 PASS
+./bench/test_ydrop                 # 832 PASS
+FUZZ=1000 ./bench/test_ydrop       # 4032 PASS
+FUZZ=3000 ./bench/test_ydrop       # 12032 PASS
 ```
 
 #### Step-axis Pareto sweeps across five regimes
@@ -1932,12 +1997,18 @@ In rough order:
    species regime (hg-vs-CHM13 match15) is 1.9× cheaper per cell
    than the others, suggesting the inner loop simplifies to a
    straight-line update when identity is very high.
-3a. ✓ **Textbook 2-D y-drop reference (`ydrop_sane`)** validated
-   bit-identical against lastz on 2016 cases (8 hand-crafted +
-   1000 random fuzz pairs, each run forward and reversed). See
-   "A textbook 2-D reference for `ydrop_one_sided_align`" in §11.
-   This gives us a clean recurrence to GPU-port without having
-   to fight lastz's sweep-row buffer arithmetic.
+3a. ✓ **Two textbook y-drop references (`ydrop_sane`)** both
+   validated bit-identical against lastz on 12032 cases (8 hand-
+   crafted + 3000 random fuzz pairs, each run forward and reversed,
+   each comparison run against both impls). See "Two textbook
+   references for `ydrop_one_sided_align`" in §11.
+   - `ydrop_one_sided_align_impl_sane`: full `(M+1) × (N+1)`
+     matrices, the obvious-but-wasteful version (~52 MB at M=N=2000).
+     Reading copy.
+   - `ydrop_one_sided_align_impl_sane_double_buffered`: lastz-matching
+     memory profile (sweep-row scores + band-compact link tape),
+     ~600 KB per call at M=N=2000. Use this for in-situ runtime
+     A/B swap against `ydrop_one_sided_align`.
 4. **Re-run bird_z_cross with variance.** Submit again with
    `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
    median + min/max for the chr-scale wall and stage breakdown.

@@ -2,18 +2,22 @@
 //
 // File: bench/test_ydrop.c
 //
-// Validation driver for ydrop_one_sided_align_impl_sane. Runs both the
-// textbook 2-D row-major impl from lastz/src/ydrop_sane.c and the original
-// lastz ydrop_one_sided_align (via the for_testing trampoline added in
-// gapped_extend.c) on a small corpus of cases, then compares output.
+// Validation driver for both textbook ports in lastz/src/ydrop_sane.c:
 //
-// For each case we run the comparison TWICE:
-//   - forward direction:  both impls on (A, B)
-//   - reverse direction:  both impls on (rev(A), rev(B)), with lastz called
-//     in reversed=1 mode so the rev1/rev2 sweep semantics are equivalent to
-//     our forward-only sane impl on the byte-reversed inputs.
+//   - ydrop_one_sided_align_impl_sane                      ("sane")
+//   - ydrop_one_sided_align_impl_sane_double_buffered      ("sane_db")
 //
-// Exit code 0 iff every case matches lastz on (score, end1, end2,
+// Each is compared against lastz's ydrop_one_sided_align (via the
+// for_testing trampoline in gapped_extend.c) on a small corpus of cases.
+//
+// For each case we run the comparison in TWO directions:
+//   - forward direction:  all three impls on (A, B)
+//   - reverse direction:  all three impls on (rev(A), rev(B)), with
+//                         lastz called in reversed=1 mode
+//
+// Per case this yields 4 PASS/FAIL points: {sane, sane_db} x {fwd, rev}.
+//
+// Exit code 0 iff every comparison matches lastz on (score, end1, end2,
 // edit-script). Exit code 1 on the first FAIL with diagnostic detail.
 //
 //----------
@@ -106,132 +110,132 @@ static void print_edit_script (FILE *f, const char *tag, editscript *s)
     fprintf (f, "\n");
     }
 
-// ---- one validation call -----------------------------------------------
+// Function-pointer type matching both sane impls' signatures.
+typedef score (*sane_impl_fn) (
+    const u8 *, unspos,
+    const u8 *, unspos,
+    scorerow *,
+    score, score, score,
+    editscript **,
+    unspos *, unspos *);
 
-typedef struct case_result
+typedef struct sane_impl_descr
     {
-    int passed;
-    score sL, sS;
-    unspos e1L, e2L, e1S, e2S;
-    } case_result;
+    const char  *name;       // short tag for logs
+    sane_impl_fn fn;
+    } sane_impl_descr;
 
-// Run lastz vs sane on a single (A, B) pair in one direction.
-static case_result run_one_direction
+static sane_impl_descr SANE_IMPLS[] = {
+    { "sane",    ydrop_one_sided_align_impl_sane                   },
+    { "sane_db", ydrop_one_sided_align_impl_sane_double_buffered   },
+};
+static const int N_SANE_IMPLS =
+    (int)(sizeof(SANE_IMPLS) / sizeof(SANE_IMPLS[0]));
+
+// ---- one impl-vs-lastz comparison ---------------------------------------
+//
+// Compares ONE sane impl against lastz on a given (A, B, direction). Lastz
+// is the reference. Returns 1 on pass, 0 on fail; prints a one-line
+// PASS/FAIL record either way.
+//
+static int compare_one
    (const char *case_name, const char *direction,
+    const sane_impl_descr *impl,
     u8 *A, unspos M, u8 *B, unspos N,
     int reversed,
     scoreset *scoring, score yDrop, tback *tb)
     {
-    case_result r = {0};
-
     editscript *es_lastz = edit_script_new ();
     editscript *es_sane  = edit_script_new ();
 
-    r.sL = ydrop_one_sided_align_for_testing (
-                A, B, M, N, scoring, yDrop, tb,
-                reversed, /*trimToPeak=*/1,
-                &es_lastz, &r.e1L, &r.e2L);
+    score  sL, sS;
+    unspos e1L, e2L, e1S, e2S;
 
-    r.sS = ydrop_one_sided_align_impl_sane (
-                A, M, B, N, scoring->sub,
-                scoring->gapOpen, scoring->gapExtend, yDrop,
-                &es_sane, &r.e1S, &r.e2S);
+    sL = ydrop_one_sided_align_for_testing (
+             A, B, M, N, scoring, yDrop, tb,
+             reversed, /*trimToPeak=*/1,
+             &es_lastz, &e1L, &e2L);
 
-    int ok = (r.sL == r.sS) && (r.e1L == r.e1S) && (r.e2L == r.e2S)
+    sS = impl->fn (
+             A, M, B, N, scoring->sub,
+             scoring->gapOpen, scoring->gapExtend, yDrop,
+             &es_sane, &e1S, &e2S);
+
+    int ok = (sL == sS) && (e1L == e1S) && (e2L == e2S)
           && edit_scripts_equal (es_lastz, es_sane);
-    r.passed = ok;
+
+    char label[80];
+    snprintf (label, sizeof(label), "%s [%s]", case_name, impl->name);
 
     if (ok)
-        printf ("[PASS] %-30s %-7s  score=%d  end=(%lu,%lu)  scriptlen=%u\n",
-                case_name, direction,
-                (int) r.sL, (unsigned long) r.e1L, (unsigned long) r.e2L,
+        printf ("[PASS] %-40s %-7s  score=%d  end=(%lu,%lu)  scriptlen=%u\n",
+                label, direction,
+                (int) sL, (unsigned long) e1L, (unsigned long) e2L,
                 (unsigned) es_lastz->len);
     else
         {
-        printf ("[FAIL] %-30s %-7s\n", case_name, direction);
-        printf ("  lastz: score=%d end=(%lu,%lu)\n",
-                (int) r.sL, (unsigned long) r.e1L, (unsigned long) r.e2L);
-        printf ("  sane:  score=%d end=(%lu,%lu)\n",
-                (int) r.sS, (unsigned long) r.e1S, (unsigned long) r.e2S);
+        printf ("[FAIL] %-40s %-7s\n", label, direction);
+        printf ("  lastz:   score=%d end=(%lu,%lu)\n",
+                (int) sL, (unsigned long) e1L, (unsigned long) e2L);
+        printf ("  %-6s:  score=%d end=(%lu,%lu)\n",
+                impl->name, (int) sS,
+                (unsigned long) e1S, (unsigned long) e2S);
         print_edit_script (stdout, "lastz script", es_lastz);
         print_edit_script (stdout, "sane  script", es_sane);
         }
 
     free_if_valid ("test_ydrop es_lastz", es_lastz);
     free_if_valid ("test_ydrop es_sane",  es_sane);
-    return r;
+    return ok;
     }
 
-// Run BOTH directions for a case (via input reversal for the reverse test).
-static int run_case (const char *name, const char *Astr, const char *Bstr,
-                     score yDrop, scoreset *scoring, tback *tb)
+// Run BOTH directions x ALL sane impls on a case (via input reversal for
+// the reverse test). Returns total comparisons performed and how many
+// passed, via out-params.
+static void run_case (const char *name, const char *Astr, const char *Bstr,
+                      score yDrop, scoreset *scoring, tback *tb,
+                      int *out_total, int *out_passed)
     {
     unspos M, N;
-    u8 *A = dup_seq (Astr, &M);
-    u8 *B = dup_seq (Bstr, &N);
+    u8 *A  = dup_seq (Astr, &M);
+    u8 *B  = dup_seq (Bstr, &N);
     u8 *rA = reverse_seq (A, M);
     u8 *rB = reverse_seq (B, N);
 
-    case_result fwd = run_one_direction (name, "forward",
-                                          A, M, B, N, /*reversed=*/0,
-                                          scoring, yDrop, tb);
+    int total = 0, passed = 0;
 
-    // For the reversed direction: lastz expects the ORIGINAL strings A,B
-    // and reversed=1, while our sane impl gets the byte-reversed strings.
-    // Both should produce the same alignment shape.
-    //
-    // (lastz's ydrop_one_sided_align(reversed=1) is the same DP run on the
-    // sequences that the caller would have prepared as rev1, rev2 — i.e.
-    // byte-reversed. Our sane forward-only impl on rA, rB does that
-    // directly.)
-    case_result rev_lastz = {0};
-    case_result rev_sane  = {0};
-    {
-    editscript *es_lastz = edit_script_new ();
-    editscript *es_sane  = edit_script_new ();
-    rev_lastz.sL = ydrop_one_sided_align_for_testing (
-                       rA, rB, M, N, scoring, yDrop, tb,
-                       /*reversed=*/1, /*trimToPeak=*/1,
-                       &es_lastz, &rev_lastz.e1L, &rev_lastz.e2L);
-    rev_sane.sL = ydrop_one_sided_align_impl_sane (
-                      rA, M, rB, N, scoring->sub,
-                      scoring->gapOpen, scoring->gapExtend, yDrop,
-                      &es_sane, &rev_sane.e1L, &rev_sane.e2L);
-    int ok = (rev_lastz.sL == rev_sane.sL)
-          && (rev_lastz.e1L == rev_sane.e1L)
-          && (rev_lastz.e2L == rev_sane.e2L)
-          && edit_scripts_equal (es_lastz, es_sane);
-    if (ok)
-        printf ("[PASS] %-30s reverse  score=%d  end=(%lu,%lu)  scriptlen=%u\n",
-                name, (int) rev_lastz.sL,
-                (unsigned long) rev_lastz.e1L, (unsigned long) rev_lastz.e2L,
-                (unsigned) es_lastz->len);
-    else
+    for (int i = 0; i < N_SANE_IMPLS; i++)
         {
-        printf ("[FAIL] %-30s reverse\n", name);
-        printf ("  lastz: score=%d end=(%lu,%lu)\n",
-                (int) rev_lastz.sL,
-                (unsigned long) rev_lastz.e1L,
-                (unsigned long) rev_lastz.e2L);
-        printf ("  sane:  score=%d end=(%lu,%lu)\n",
-                (int) rev_sane.sL,
-                (unsigned long) rev_sane.e1L,
-                (unsigned long) rev_sane.e2L);
-        print_edit_script (stdout, "lastz script", es_lastz);
-        print_edit_script (stdout, "sane  script", es_sane);
-        }
-    rev_lastz.passed = ok;
+        total++;
+        if (compare_one (name, "forward",
+                         &SANE_IMPLS[i],
+                         A, M, B, N, /*reversed=*/0,
+                         scoring, yDrop, tb))
+            passed++;
 
-    free_if_valid ("test_ydrop es_lastz", es_lastz);
-    free_if_valid ("test_ydrop es_sane",  es_sane);
-    }
+        // For the reversed direction: lastz expects the ORIGINAL strings
+        // A,B and reversed=1, while our sane impls get the byte-reversed
+        // strings. Both should produce the same alignment shape.
+        //
+        // (lastz's ydrop_one_sided_align(reversed=1) is the same DP run on
+        // the sequences that the caller would have prepared as rev1, rev2
+        // — i.e. byte-reversed. Our sane forward-only impls on rA, rB do
+        // that directly.)
+        total++;
+        if (compare_one (name, "reverse",
+                         &SANE_IMPLS[i],
+                         rA, M, rB, N, /*reversed=*/1,
+                         scoring, yDrop, tb))
+            passed++;
+        }
 
     free_if_valid ("test_ydrop A",  A);
     free_if_valid ("test_ydrop B",  B);
     free_if_valid ("test_ydrop rA", rA);
     free_if_valid ("test_ydrop rB", rB);
 
-    return fwd.passed && rev_lastz.passed;
+    *out_total  = total;
+    *out_passed = passed;
     }
 
 // ---- random sequence generator (xorshift, deterministic) ----------------
@@ -308,7 +312,7 @@ int main (int argc, char **argv)
     tback *tb = new_traceback (10 * 1024 * 1024);   // 10 MB
     if (tb == NULL) { fprintf (stderr, "traceback alloc failed\n"); return 1; }
 
-    int total = 0, failed = 0;
+    int total = 0, passed = 0;
 
     // ---- Hand-crafted cases ----
     struct hc_case { const char *name, *A, *B; score yDrop; };
@@ -327,15 +331,16 @@ int main (int argc, char **argv)
 
     for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++)
         {
-        total += 2;   // each case = forward + reverse
-        if (!run_case (cases[i].name, cases[i].A, cases[i].B,
-                       cases[i].yDrop, scoring, tb))
-            failed += 2;   // count both halves as failed for accounting
+        int t = 0, p = 0;
+        run_case (cases[i].name, cases[i].A, cases[i].B,
+                  cases[i].yDrop, scoring, tb, &t, &p);
+        total  += t;
+        passed += p;
         }
 
     // ---- Fuzz loop: random pairs at varying length / identity ----
     // Default 200 cases; override via FUZZ=<N> env var. Each case produces
-    // 2 comparison points (forward + reverse).
+    // (2 directions x N_SANE_IMPLS) comparison points.
     int fuzz_runs = 200;
     {
     const char *env = getenv ("FUZZ");
@@ -356,9 +361,10 @@ int main (int argc, char **argv)
         char tag[64];
         snprintf (tag, sizeof(tag), "fuzz_%03d_len%u_id%u", k, (unsigned) len, ident);
 
-        total += 2;
-        if (!run_case (tag, A, B, /*yDrop=*/910, scoring, tb))
-            failed += 2;
+        int t = 0, p = 0;
+        run_case (tag, A, B, /*yDrop=*/910, scoring, tb, &t, &p);
+        total  += t;
+        passed += p;
 
         free (A);
         free (B);
@@ -368,9 +374,12 @@ int main (int argc, char **argv)
     free_traceback (tb);
     free_score_set ("test_ydrop scoring", scoring);
 
+    int failed = total - passed;
     printf ("\n=========================================\n");
     printf ("test_ydrop summary: %d / %d passed (%d failed)\n",
-            total - failed, total, failed);
+            passed, total, failed);
+    printf ("(per case: %d sane impls x 2 directions = %d comparisons)\n",
+            N_SANE_IMPLS, 2 * N_SANE_IMPLS);
     printf ("=========================================\n");
     return failed == 0 ? 0 : 1;
     }
