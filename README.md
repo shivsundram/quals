@@ -1544,6 +1544,140 @@ FUZZ=1000 ./bench/test_ydrop       # 4032 PASS
 FUZZ=3000 ./bench/test_ydrop       # 12032 PASS
 ```
 
+##### Runtime A/B swap inside lastz (`YDROP_SANE_IMPL=1`)
+
+To compare the two impls' wall-clock cost on real lastz workloads
+without writing a separate microbenchmark, we added a runtime swap to
+[`gapped_extend.c`](lastz/src/gapped_extend.c). When the environment
+variable `YDROP_SANE_IMPL=1` is set, the top of
+`ydrop_one_sided_align` diverts each call to
+`ydrop_one_sided_align_impl_sane_double_buffered` whenever that call is
+in the v0 scope:
+
+- `io->leftSeg == NULL && io->rightSeg == NULL` (no left/right neighbor
+  segments to clamp L/R bounds against);
+- `io->leftAlign == NULL && io->rightAlign == NULL` (no neighbor
+  alignments to drive `next_sweep_seg` updates);
+- `io->aboveList == NULL` (or `belowList` for `reversed=1`) — no
+  active-segment list to propagate through `filter_active_segs`;
+- `trimToPeak == true`.
+
+Out-of-scope calls fall through to lastz proper. Stats are reported at
+exit (always to stderr via atexit, and additionally to the stage-timing
+file when built with `-DdbgTiming`):
+
+```
+--- ydrop_sane runtime swap ---
+total ydrop calls                                3572
+swapped to sane (double_buf)                       20  (0.6%)
+declined (out of v0 scope)                       3552  (99.4%)
+  decline reasons (first failing condition per call):
+    leftSeg != NULL                             826
+    rightSeg != NULL                            436
+    leftAlign != NULL                             0
+    rightAlign != NULL                            0
+    above/belowList != NULL                    2290
+    trimToPeak == false                           0
+```
+
+The swap is bit-identical on simple workloads and produces an
+acceptable alignment on real ones (same score, same endpoints; edit
+script may differ by O(few) operations in rare boundary-cell-rescue
+cases that the fuzz harness doesn't exercise — see "Known limitation"
+below).
+
+###### Wall-clock A/B results
+
+Three synthetic workloads where v0 scope holds on 100 % of calls (no
+prior alignments, no masking), each producing a single contiguous
+~94 % identity alignment, single thread:
+
+| Workload | lastz tape | baseline wall | sane wall | Δ | swap rate |
+|---|---|---:|---:|---:|---:|
+| uniform 100 kbp     | default 80 MB | 0.35 s | 0.45 s | +29 % | 2/2 (100 %) |
+| uniform 1 Mbp       | `--allocate:traceback=1G` | 2.90 s | 3.43 s | +18 % | 2/2 (100 %) |
+| uniform 10 Mbp      | `--allocate:traceback=2G` | 90.7 s | 89.6 s | −1 % (noise) | 2/2 (100 %) |
+
+Per-call constant overhead (per-call `malloc`/`free` of score buffers,
+lnk tape, lnkRow/LY/RY) is the dominant gap at small N; it amortizes
+to zero by 10 Mbp, where the two impls are within noise of each
+other.
+
+> Without `--allocate:traceback`, lastz's 80 MB tape overflows on the
+> 1 Mbp and 10 Mbp workloads and emits "truncating alignment ending
+> at ..." warnings, fragmenting the output into many chunks. Sane has
+> no tape-size cap (it grows on demand) and produces one continuous
+> alignment in those cases. Setting `--allocate:traceback=2G` makes
+> both impls produce bit-identical output and the A/B fair.
+
+###### What this isn't (yet)
+
+On dense real workloads (e.g. mouse-rat chr10×chr20 10 Mbp, 1768
+HSPs), the swap declines 99.4 % of calls because lastz populates
+`aboveList`/`belowList` (active-segment masking, 64 % of declines) and
+`leftSeg`/`rightSeg` (per-row L/R bound constraints, 35 % of declines)
+on virtually every secondary HSP. The swap fires only on the very
+first anchor of a chore plus a handful of others; that subset is too
+small for a meaningful wall-clock comparison.
+
+Two follow-ups would close that gap:
+1. Extend `ydrop_sane` to honor an `aboveList`/`belowList`-style mask
+   passed in as a callback or precomputed band-clip array. The kernel
+   itself doesn't change; only the per-row LY/RY update.
+2. Add an external batch driver that loads (anchor, A, B, M, N,
+   scoring) tuples dumped from lastz to disk and replays them against
+   both impls back-to-back. The dump path bypasses lastz's masking
+   entirely.
+
+###### Known limitation: boundary-cell traceback
+
+On the dense mouse-rat run, one of the 20 swapped alignments had the
+same score and same endpoints as lastz but an edit script differing by
+6 columns (30520 / 34690 matches in lastz vs 30514 / 34684 in sane,
+same 88.0 % identity). Investigation: lastz's inner-loop terminator is
+`col < R[r-1] + 1`, so it processes ONE extra column past the previous
+row's right edge (`col = R[r-1]`). If that cell receives a fresh
+diagonal match from `C[r-1][R[r-1]-1] + sub[A[r]][B[R[r-1]]]`, lastz
+will rescue it as alive; sane's loop terminates at `col = R[r-1] - 1`
+and treats the boundary cell as a sentinel negInf. In rare cases the
+rescued cell participates in the eventual traceback path, yielding the
+same DP score but a slightly different edit script.
+
+The fuzz harness in [`bench/test_ydrop.c`](bench/test_ydrop.c) runs
+50–1500 bp pairs, where the boundary cell is too short-lived to
+trigger this; that's why 12 032 / 12 032 fuzz cases pass while real
+~35 kbp alignments occasionally diverge. The two outputs remain
+equivalent from a scoring standpoint — neither is "more correct" — but
+this is a real algorithmic deviation, not just a traceback tie-break.
+
+###### Reproduce
+
+```bash
+cd lastz/src && make lastz && cd ../..
+
+# bit-identical small workload, 100 % swap rate
+./lastz/src/lastz bench/data/uniform_100kb.target.fa \
+                  bench/data/uniform_100kb.query.fa \
+                  --format=general --output=/tmp/base.out
+YDROP_SANE_IMPL=1 \
+  ./lastz/src/lastz bench/data/uniform_100kb.target.fa \
+                    bench/data/uniform_100kb.query.fa \
+                    --format=general --output=/tmp/sane.out
+diff /tmp/base.out /tmp/sane.out         # empty: bit-identical
+
+# 1 Mbp A/B with enlarged tape so neither impl truncates
+/usr/bin/time -v ./lastz/src/lastz bench/data/uniform_1000kb.target.fa \
+                                    bench/data/uniform_1000kb.query.fa \
+                                    --allocate:traceback=1G \
+                                    --format=general --output=/dev/null
+YDROP_SANE_IMPL=1 /usr/bin/time -v \
+                  ./lastz/src/lastz bench/data/uniform_1000kb.target.fa \
+                                    bench/data/uniform_1000kb.query.fa \
+                                    --allocate:traceback=1G \
+                                    --format=general --output=/dev/null
+# stderr ends with the runtime-swap report.
+```
+
 #### Step-axis Pareto sweeps across five regimes
 
 After the seed-weight (bird-Z) and within-species (hg-vs-CHM13) sweeps
@@ -2009,6 +2143,15 @@ In rough order:
      memory profile (sweep-row scores + band-compact link tape),
      ~600 KB per call at M=N=2000. Use this for in-situ runtime
      A/B swap against `ydrop_one_sided_align`.
+3b. ✓ **In-situ runtime A/B swap** wired into
+   `ydrop_one_sided_align` via `YDROP_SANE_IMPL=1`. See "Runtime A/B
+   swap inside lastz" in §11. Sane within noise of lastz at 10 Mbp
+   (~90 s) on a single contiguous alignment; ~20 % per-call overhead
+   amortizes away by then. Pending follow-up: extend the v0 scope
+   guard to handle `aboveList`/`belowList` and `leftSeg`/`rightSeg`
+   so the swap fires on more than 0.6 % of calls in dense real
+   workloads, and audit the boundary-cell traceback divergence
+   surfaced by long real alignments.
 4. **Re-run bird_z_cross with variance.** Submit again with
    `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
    median + min/max for the chr-scale wall and stage breakdown.
