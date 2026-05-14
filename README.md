@@ -1864,6 +1864,142 @@ LASTZ_DISABLE_NEIGHBOR_MASK=1 LASTZ_DISABLE_CONTAINMENT=1 \
                     --output=/tmp/exp2_2b.out
 ```
 
+##### T1: OpenMP batched parallel y-drop
+
+The dependency study above said two things: (1) cross-anchor masking
+is cosmetic on output (bp-set Jaccard 0.9977 vs baseline when off),
+and (2) containment-skip is essential for not eating 10× the work.
+So a parallel implementation can drop masking but has to keep
+containment. T1 is the natural prototype on a 40-core box before
+spending GPU engineering effort.
+
+###### Design
+
+Activated by `LASTZ_PARALLEL_YDROP=K` in the environment (K = batch
+size, e.g. 64); thread count from `OMP_NUM_THREADS`. Off by default;
+the existing serial path is byte-identical when unset (and also when
+the binary is built without `omp=ON`).
+
+The implementation pivots on two pieces already in tree:
+
+1. `ydrop_one_sided_align_impl_sane_double_buffered` from
+   [`ydrop_sane.c`](lastz/src/ydrop_sane.c). It mallocs all its
+   scratch per call (no module-static `tback` / `dpMatrix`), so it's
+   thread-safe by construction. Validated bit-identical to
+   `ydrop_one_sided_align` on 12 000+ test cases in the v0 scope
+   (masking off, trimToPeak=true).
+2. The Experiment-2a finding that running lastz with masking forced
+   off changes the bp-set Jaccard by ~0.2 % and the wall time by
+   ~8 %. So forcing masking off in parallel mode is acceptable.
+
+A new `ydrop_align_sane()` static in `gapped_extend.c` mirrors
+`ydrop_align()` but calls the sane impl for both halves. The anchor
+loop then dispatches like this when parallel mode is on:
+
+```
+while (par_j < endSegIx) {
+    // Phase 1: serial scan, fill pending[] with up to K survivors
+    while (par_j < endSegIx && n_pending < K) {
+        if (msp_left_right(orderBegInc, msp[par_j]))
+            pending[n_pending++] = par_j;
+        par_j++;
+    }
+    if (n_pending == 0) break;
+
+    // Phase 2: parallel y-drop on the K survivors
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (pi = 0; pi < n_pending; pi++)
+        run_ydrop_align_sane_on(pending[pi]);
+
+    // Phase 3: serial commit in score order
+    for (pi = 0; pi < n_pending; pi++) {
+        in_batch_containment_recheck();   // rare among survivors
+        score_threshold_filter();
+        align_left_right();
+        insert_align();
+    }
+}
+```
+
+Key property: **no speculative work amplification.** Y-drop runs
+on exactly the same survivors the serial path would commit, because
+the containment-skip walk happens before y-drop, on the master
+thread, against the live `orderBegInc`. The in-batch recheck only
+fires when an earlier survivor in the same batch shadows a later
+one — rare among survivors that already passed serial containment.
+
+###### Mouse-rat 10 Mbp strong-scaling
+
+`make lastz_T omp=ON`, K=64, full 10 Mbp slice:
+
+| threads  | total wall | gapped ext | y-drop wall | speedup (gext) | speedup (total) |
+|---------:|-----------:|-----------:|------------:|---------------:|----------------:|
+| baseline | 43.3 s     | 21.3 s     | 21.2 s      | 1.00×          | 1.00×           |
+| 1        | 106.4 s    | 84.6 s     | 84.5 s      | 0.25×          | 0.41×           |
+| 2        | 61.9 s     | 39.8 s     | 39.7 s      | 0.54×          | 0.70×           |
+| 4        | 40.5 s     | 18.9 s     | 18.8 s      | 1.13×          | 1.07×           |
+| 8        | 34.9 s     | 12.8 s     | 12.7 s      | 1.66×          | 1.24×           |
+| 16       | 34.8 s     | 11.4 s     | 11.3 s      | 1.87×          | 1.24×           |
+| 32       | **33.9 s** | **10.5 s** | 10.3 s      | **2.03×**      | **1.28×**       |
+| 40       | 35.1 s     | 11.2 s     | 11.1 s      | 1.90×          | 1.23×           |
+
+- **Gapped extension halves** at 32 threads (10.5 s vs baseline 21.3
+  s). 8× speedup on y-drop wall going from 1→32 threads.
+- **Total wall caps at 1.28×** because seed-search (~21 s, single-
+  threaded) is now the bottleneck. Amdahl ceiling on this regime
+  with serial seed search is ~2× total wall, ~10× on gapped
+  extension alone.
+- **The 1-thread number is 4× slower than baseline** (84 vs 21 s on
+  the same y-drop work). That's the per-call cost of the sane impl
+  vs lastz's native: the sane impl mallocs ~5 scratch buffers per
+  call while lastz reuses one module-static 80 MB `tback` tape
+  across all calls. Closing that gap (per-thread arena allocator,
+  reusable scratch buffers) would push the 32-thread y-drop wall
+  from ~10 s toward ~3 s and the total wall toward the Amdahl
+  ceiling.
+- **Output correctness**: bp-set Jaccard 0.9977 vs baseline (matches
+  variant 2a, masking-off semantics — same homologous DNA, slightly
+  different alignment packaging). 1801 alignments vs baseline 1768.
+  Bit-identical across thread counts (Jaccard 1.0 between 1- and
+  40-thread runs — output is deterministic and reproducible).
+
+###### Implications
+
+- **CPU dependency-breaking works.** The cross-anchor sequentialism
+  is solvable on a 40-core box: ~2× speedup on the gapped-extension
+  stage, ~1.3× total wall, with no biological output drift. Same
+  algorithmic strategy a GPU port would have to use.
+- **Per-call kernel cost is the budget.** Even with perfect 32-way
+  parallelism we'd run out of speedup at ~5 s gapped extension on
+  this regime if the sane impl stays at 47 ms/call. Closing the gap
+  to lastz native (~12 ms/call masking on, ~28 ms/call masking off)
+  is worth ~3× on the parallel path. A GPU kernel can lean
+  much harder here than per-thread arena tricks can on CPU.
+- **Seed search becomes the next ceiling.** On dense regimes, once
+  gapped extension is parallel, seed_search is ~50 % of wall.
+  SegAlign's GPU seed-hit dedup is the relevant precedent.
+
+###### Reproduce
+
+```bash
+cd lastz/src && make clean && make lastz lastz_T omp=ON && cd ../..
+
+# Sanity check: parallel off is byte-identical to omp=OFF baseline
+./lastz/src/lastz bench/data/uniform_100kb.target.fa \
+                  bench/data/uniform_100kb.query.fa \
+                  --format=general --output=/tmp/par_off.out
+
+# Strong-scaling sweep
+for t in 1 2 4 8 16 32 40; do
+    LASTZ_PARALLEL_YDROP=64 OMP_NUM_THREADS=$t \
+      LASTZ_STAGE_REPORT=/tmp/A.$t.stage \
+      ./lastz/src/lastz_T bench/data_genomes/mm10.chr10_40_50mb.fa \
+                          bench/data_genomes/rn6.chr20_40_50mb.fa \
+                          --allocate:traceback=2G --format=general \
+                          --output=/tmp/A.$t.out
+done
+```
+
 #### Step-axis Pareto sweeps across five regimes
 
 After the seed-weight (bird-Z) and within-species (hg-vs-CHM13) sweeps
@@ -2347,6 +2483,23 @@ In rough order:
    with no masking, persistent threads + work queue to batch calls,
    parallel-greedy-suppress as the GPU post-pass replacement for
    `msp_left_right`.
+3d. ✓ **T1: OpenMP batched parallel y-drop on a 40-core box.** See
+   "T1: OpenMP batched parallel y-drop" in §11. Built and tuned the
+   right dependency-breaking shape: serial scan over msp[] doing
+   `msp_left_right` (cheap, ~17 ms total) collects survivors into
+   batches of K, parallel `#pragma omp parallel for` runs
+   `ydrop_align_sane` on the K survivors, serial commit pass applies
+   in-batch containment recheck + score-threshold filter +
+   `align_left_right` + `insert_align`. On mouse-rat 10 Mbp: 2.03×
+   speedup on gapped extension at 32 threads (10.5 s vs 21.3 s),
+   1.28× total wall (33.9 s vs 43.3 s), bit-identical output across
+   thread counts, bp-set Jaccard 0.9977 vs baseline (matches the
+   masking-off variant 2a). Bottlenecks: (a) Amdahl on serial
+   seed_search caps total wall; (b) `ydrop_align_sane` is ~4× slower
+   per-call than lastz's native `ydrop_align` because the sane impl
+   mallocs scratch per call instead of reusing a module-static tape
+   — closing that gap with a per-thread arena allocator would push
+   the 32-thread gapped-extension wall from ~10 s toward ~3 s.
 4. **Re-run bird_z_cross with variance.** Submit again with
    `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
    median + min/max for the chr-scale wall and stage breakdown.
