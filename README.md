@@ -1678,6 +1678,192 @@ YDROP_SANE_IMPL=1 /usr/bin/time -v \
 # stderr ends with the runtime-swap report.
 ```
 
+##### Cross-anchor sequential-dependency study
+
+After establishing that the in-situ A/B swap declines 99.4 % of calls on
+dense workloads, we wanted to know whether a GPU y-drop kernel is even
+worth pursuing if the outer anchor loop has a true loop-carried
+dependency. Three experiments answer this end-to-end:
+
+1. **Anchor-loop instrumentation** ([`gapped_extend.c`](lastz/src/gapped_extend.c)):
+   counters at `msp_left_right` that measure how many anchors get
+   skipped before y-drop runs, plus per-call walks of `aboveList` /
+   `belowList` to gauge the neighbor-alignment chain depth.
+2. **Per-call y-drop matrix log**: env-var-gated CSV
+   (`YDROP_CALL_LOG=path`) dumping `(M, N, rows_processed, max_band,
+   cells_visited, cycles_total, peak_score)` for each
+   `ydrop_one_sided_align` call. Lets us characterize the actual DP
+   shape rather than the worst-case bound passed in.
+3. **Masking / containment-skip ablation**: two new env-var gates,
+   `LASTZ_DISABLE_NEIGHBOR_MASK=1` (NULL the six `alignio` neighbor
+   fields right before `ydrop_align`) and `LASTZ_DISABLE_CONTAINMENT=1`
+   (ignore the `msp_left_right` skip), let us run the lastz pipeline
+   with either or both of the cross-anchor mechanisms disabled and
+   diff the output against baseline.
+
+All three were run on three 10 Mbp slices that span the alignable-
+density axis: bird-Z (`galGal6.chrZ_0_10mb` × `taeGut2.chrZ_0_10mb`),
+mouse-rat (`mm10.chr10_40_50mb` × `rn6.chr20_40_50mb`), and within-
+species (`hg38.chr1_50_60mb` × `hs1.chr1_50_60mb`).
+
+###### Anchor-loop containment + chain depth
+
+| regime    | total anchors | skipped (contained) | ran y-drop | aboveList non-empty | mean chain | max chain |
+|-----------|--------------:|--------------------:|-----------:|--------------------:|-----------:|----------:|
+| bird-Z    |        1 665  | 1 154 (69 %)        | 511  (31 %)| 97 %                |       100  |    428    |
+| mouse-rat |       17 982  | 16 196 (90 %)       | 1 786 (10 %)| 99 %               |       285  |   1 294   |
+| hg-CHM13  |       24 376  | 21 901 (90 %)       | 2 475 (10 %)| 99 %               |       473  |   2 246   |
+
+Two findings drop out:
+- **The seed stage's output is enormously redundant.** 70 – 90 % of
+  HSPs are sub-regions of bigger HSPs that already won the scoring
+  contest; gapped_extend's first job is to throw them out. (SegAlign's
+  GPU `thrust::unique_copy` is doing essentially the same dedup,
+  earlier in the pipeline.)
+- **Survivors are deeply coupled.** Almost every y-drop call has 100 +
+  neighbor alignments to mask against. So the v0-swap's earlier
+  "99.4 % decline because `aboveList` non-NULL" was not "list has 1-2
+  entries" but "list has *hundreds* of entries". Whether masking
+  matters is the question Experiment 2 below answers.
+
+###### Per-call DP shape
+
+| regime    | calls  | median cells | p95 cells | median rows | median band | median cyc | max cyc |
+|-----------|-------:|-------------:|----------:|------------:|------------:|-----------:|--------:|
+| bird-Z    | 1 022  | 633 K        | 1.6 M     | 1 287       | 676         | 12.1 M     | 78.6 M  |
+| mouse-rat | 3 572  | 554 K        | 2.5 M     | 1 241       | 623         | 10.2 M     | 136 M   |
+| hg-CHM13  | 4 950  | 332 K        | 884 K     | 1 090       | 502         | 6.9 M      | **4 054 M** |
+
+- **Per-call DP is small.** Median ~500 K cells, ~1 200 rows × ~600-
+  wide band. That is 0.000 1 of the worst-case M·N the call signature
+  allows; y-drop pruning is extremely aggressive.
+- **Distribution is bimodal.** Most calls fit in 1 – 2 M cells, but the
+  tail can hit 480 M cells / 4 G cycles (the hg-CHM13 outlier was a
+  single ~1.3 M-row alignment — a within-species ortholog).
+- **Total y-drop work per regime**: 0.8 – 5.4 B cells, 15 – 65 G cycles,
+  with ~50 % concentrated in <5 % of calls. Median 500 K cells per
+  call is too small to saturate a modern GPU on its own; the kernel
+  has to batch many calls together (persistent threads + work queue)
+  rather than launch per call.
+
+###### Ablation: masking off vs containment-skip off (mouse-rat, 10 Mbp)
+
+| variant                          | n alignments | total bp1 | bp-set Jaccard vs baseline | wall    | wall vs base |
+|----------------------------------|-------------:|----------:|---------------------------:|--------:|-------------:|
+| baseline                         |       1 767  |  4.15 M   | 1.000                       | 46.7 s  | 1.00×        |
+| 2a (mask off, contain on)        |       1 800  |  6.33 M   | **0.9977**                  | 50.3 s  | 1.08×        |
+| 2b (mask off, contain off)       |      17 982  |  140 M    | **0.9977**                  | 492 s   | **10.5×**    |
+
+"bp-set Jaccard" is the Jaccard index over the **set of target-side bp
+positions covered by at least one alignment** (1.0 = identical bp
+covered; 0.0 = no overlap). Both variants score 0.9977 against
+baseline, meaning all three runs cover essentially the same homologous
+DNA — they differ only in how that DNA is packaged into alignment
+records.
+
+What this tells us:
+- **Masking is cosmetic.** Variant 2a (no masking, containment-skip
+  intact) produces 33 more alignment records than baseline (+1.9 %),
+  total aligned bp is +53 % because alignments are longer on average,
+  but the *bp-set* covered is unchanged (Jaccard 0.9977). Looking at
+  the differences: 423 short baseline alignments (median 168 bp) get
+  absorbed into 259 longer ones (median 2.3 kbp); the underlying
+  homology is identical. Wall cost is only +8 %.
+- **Containment-skip is the real dedup.** Variant 2b (both off) produces
+  17 982 alignments (~10× baseline) — exactly the number of HSPs that
+  entered gapped_extend in Experiment 1. Total aligned bp blows up to
+  140 Mbp (34× baseline) because every anchor now produces its own
+  ~7.8 kbp alignment and they all overlap each other. Same Jaccard
+  0.9977 — same homologous territory, just hugely redundant
+  packaging. Wall blows up to 492 s (10.5×).
+
+So the cross-anchor dependency decomposes into two cleanly separable
+mechanisms with very different impact:
+
+| mechanism         | what it does                          | impact on output | impact on perf |
+|-------------------|---------------------------------------|------------------|---------------:|
+| containment-skip  | parallel-friendly **anchor dedup**    | essential        | saves ~10× work |
+| neighbor masking  | per-row clamp + per-cell mask         | cosmetic         | costs ~8 % wall |
+
+###### Implications for the GPU plan
+
+The data steer the design firmly toward one shape:
+
+1. **GPU y-drop kernel, no masking.** Banded wavefront, intra-call
+   antidiagonal parallelism, ~500-600-wide band. Drop the entire
+   `aboveList` / `belowList` / `leftSeg` / `rightSeg` plumbing — it's
+   cosmetic for output, expensive in per-row overhead, and would force
+   the GPU kernel to keep a per-row active-segment list around. The
+   ~0.2 % bp coverage delta is well within the noise of any biological
+   downstream use of these alignments.
+2. **Batched / persistent kernel.** Median 500 K cells per call is far
+   below GPU saturation. Need persistent threads pulling from a work
+   queue of (anchor, A, B, M, N, scoring) tuples so many calls can run
+   concurrently across SMs.
+3. **Outlier path.** The p99 / max calls are 100 – 1 000× bigger than
+   median; a single 4 G-cycle call can dominate. Either dispatch
+   outliers to a separate single-call high-occupancy kernel that uses
+   multiple CTAs per call, or tile every call into fixed-band chunks
+   regardless of size.
+4. **Containment-skip stays.** Without it, 10× the y-drop work and 10×
+   the wall, on output that's not biologically more useful. But the
+   *implementation* can move to a parallel GPU post-pass: y-drop every
+   anchor, then parallel-greedy-suppress in score order — each
+   alignment in parallel checks whether any higher-scoring alignment's
+   box contains its anchor. O(N²) work, trivially parallel, ~1 ms on
+   modern GPU for N ≈ 20 K. Same answer as lastz's sequential
+   `msp_left_right` because greedy-suppress is order-independent on a
+   fixed input.
+5. **A/B harness updates.** The right "lastz proper" baseline for the
+   GPU kernel A/B is `LASTZ_DISABLE_NEIGHBOR_MASK=1` (mask off,
+   contain on) — same masking decision the GPU kernel will make. Our
+   v0 swap stays useful as a pure-CPU reference impl.
+
+Back-of-envelope ceiling: mouse-rat baseline does ~50 G cycles in
+y-drop on a single thread (≈17 s of pure y-drop CPU work). A modern
+GPU at ~10 TFLOPS effective DP throughput can do 3 B cells in ~3 ms;
+even at 100× pessimism (launch overhead, transfers, tail effects),
+that's ~300 ms. On the 90 % of wall that gapped extension owns on
+dense regimes, a realistic **10 – 50× speedup on y-drop** translates
+to ~5 – 15× overall.
+
+###### Reproduce
+
+```bash
+cd lastz/src && make lastz lastz_TS && cd ../..
+
+# Experiments 1 + 3: anchor-loop + per-call distribution
+mkdir -p /tmp/exp13
+for r in birdz mr hg; do
+    case $r in
+      birdz) T=galGal6.chrZ_0_10mb; Q=taeGut2.chrZ_0_10mb;;
+      mr)    T=mm10.chr10_40_50mb;  Q=rn6.chr20_40_50mb;;
+      hg)    T=hg38.chr1_50_60mb;   Q=hs1.chr1_50_60mb;;
+    esac
+    YDROP_CALL_LOG=/tmp/exp13/$r.csv \
+    LASTZ_STAGE_REPORT=/tmp/exp13/$r.stage \
+      ./lastz/src/lastz_TS bench/data_genomes/$T.fa bench/data_genomes/$Q.fa \
+        --allocate:traceback=2G --format=general \
+        --output=/tmp/exp13/$r.out 2>&1 | tail -2
+done
+
+# Experiment 2: ablation on mouse-rat
+./lastz/src/lastz bench/data_genomes/mm10.chr10_40_50mb.fa \
+                  bench/data_genomes/rn6.chr20_40_50mb.fa \
+                  --allocate:traceback=2G --format=general \
+                  --output=/tmp/exp2_base.out
+LASTZ_DISABLE_NEIGHBOR_MASK=1 \
+  ./lastz/src/lastz bench/data_genomes/mm10.chr10_40_50mb.fa \
+                    bench/data_genomes/rn6.chr20_40_50mb.fa \
+                    --allocate:traceback=2G --format=general \
+                    --output=/tmp/exp2_2a.out
+LASTZ_DISABLE_NEIGHBOR_MASK=1 LASTZ_DISABLE_CONTAINMENT=1 \
+  ./lastz/src/lastz bench/data_genomes/mm10.chr10_40_50mb.fa \
+                    bench/data_genomes/rn6.chr20_40_50mb.fa \
+                    --allocate:traceback=2G --format=general \
+                    --output=/tmp/exp2_2b.out
+```
+
 #### Step-axis Pareto sweeps across five regimes
 
 After the seed-weight (bird-Z) and within-species (hg-vs-CHM13) sweeps
@@ -2147,11 +2333,20 @@ In rough order:
    `ydrop_one_sided_align` via `YDROP_SANE_IMPL=1`. See "Runtime A/B
    swap inside lastz" in §11. Sane within noise of lastz at 10 Mbp
    (~90 s) on a single contiguous alignment; ~20 % per-call overhead
-   amortizes away by then. Pending follow-up: extend the v0 scope
-   guard to handle `aboveList`/`belowList` and `leftSeg`/`rightSeg`
-   so the swap fires on more than 0.6 % of calls in dense real
-   workloads, and audit the boundary-cell traceback divergence
-   surfaced by long real alignments.
+   amortizes away by then.
+3c. ✓ **Cross-anchor sequential-dependency study.** See "Cross-anchor
+   sequential-dependency study" in §11. Three orthogonal experiments:
+   anchor-loop containment + chain-depth counters, per-call DP-shape
+   CSV log (`YDROP_CALL_LOG=path`), and ablation gates
+   `LASTZ_DISABLE_NEIGHBOR_MASK=1` / `LASTZ_DISABLE_CONTAINMENT=1`.
+   Findings: containment-skip is essential (10× output blowup without
+   it, on the same homologous bp set), neighbor masking is cosmetic
+   (output bp-set Jaccard 0.9977 vs baseline, +8 % wall when off).
+   Median y-drop call is ~500 K cells with a ~600-wide band, far
+   below GPU saturation on its own. Path forward: GPU y-drop kernel
+   with no masking, persistent threads + work queue to batch calls,
+   parallel-greedy-suppress as the GPU post-pass replacement for
+   `msp_left_right`.
 4. **Re-run bird_z_cross with variance.** Submit again with
    `WARMUP=0 REPS=3` and the new 6h time limit; produces a clean
    median + min/max for the chr-scale wall and stage breakdown.
