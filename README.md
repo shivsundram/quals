@@ -1957,11 +1957,72 @@ one — rare among survivors that already passed serial containment.
   reusable scratch buffers) would push the 32-thread y-drop wall
   from ~10 s toward ~3 s and the total wall toward the Amdahl
   ceiling.
-- **Output correctness**: bp-set Jaccard 0.9977 vs baseline (matches
-  variant 2a, masking-off semantics — same homologous DNA, slightly
-  different alignment packaging). 1801 alignments vs baseline 1768.
-  Bit-identical across thread counts (Jaccard 1.0 between 1- and
-  40-thread runs — output is deterministic and reproducible).
+- **Output correctness**: see the four-check audit below. Summary —
+  parallel output is bit-identical across all (K, threads) configs
+  tested, 1800/1801 alignments are line-identical to lastz-native
+  serial with masking off (variant 2a), the one differing alignment
+  matches in score and coordinates but trims 6 bp differently (known
+  sane-impl vs native edge case), and per-row arithmetic is internally
+  consistent.
+
+###### Output correctness — four-check audit
+
+`bp-set Jaccard 0.9977 vs baseline` is too loose a check on its own
+(two outputs covering the same bp can have completely different
+alignment lines). The validation receipt for T1 is four checks of
+increasing strictness, all on the mouse-rat 10 Mbp dense regime.
+Reproduce as in §11 above; results stored in `/tmp/cc.*.out`.
+
+**Check 1 — strict determinism across thread counts.** All 7 runs
+at OMP_NUM_THREADS ∈ {1, 2, 4, 8, 16, 32, 40}, K=64, share one
+md5sum (`cedd53d2…`). No race conditions; output is reproducible
+bit-for-bit.
+
+**Check 2 — K × threads orthogonality.** Sweep K ∈ {1, 16, 64, 256}
+× threads ∈ {1, 4, 32}, all 12 cells share the same md5sum as
+check 1. Batch size doesn't change output, even at K=1 (where the
+in-batch recheck is a no-op because batches are size 1 — so this
+config IS a "serial pipeline with sane kernel and masking off"
+reference). Parallel orchestration is sound at every scale.
+
+**Check 3 — parallel ≡ variant 2a (serial native masking-off),
+line-by-line.** Out of 1801 alignment rows, **1800 are
+line-identical** to `LASTZ_DISABLE_NEIGHBOR_MASK=1` serial output.
+The single diverging row has identical score (2333296), identical
+start/end on both sequences, identical identity% (88.0), and
+identical bp-aligned (36254) — only the matches/length counter
+differs by 6 (30514/34684 vs 30520/34690). That's the documented
+sane-impl vs native trim divergence on a boundary-cell-rescue case,
+not parallelism-induced. Same set of 18 exact-row duplicates
+appears in both files (md5 of the duplicate row set matches), and
+those duplicates are a known artifact of masking-off (with masking,
+they'd be coalesced; without it, two anchors can trim to the same
+coords).
+
+**Check 4 — per-row self-consistency.** For each row in the parallel
+output: start ≤ end, end ≤ sequence length, matches ≤ length,
+identity% within 0.1% of computed 100·matches/length, score > 0,
+sequence-length columns match the actual FASTA. All 1800 rows pass.
+Same script (`bench/validate_lastz_general.py`) also reports exact-
+row duplicate counts and shared-bbox collision counts; on this
+regime parallel and variant 2a give identical numbers (35 rows
+across 17 duplicated row contents; 329 rows across 100 shared
+bounding boxes), and baseline gives 0 / 0, confirming the artifacts
+come from masking-off, not from parallelism.
+
+```bash
+# reproduce check 4
+python3 bench/validate_lastz_general.py /tmp/cc.K64.t32.out \
+    chr10_40000000_50000000=10000000 \
+    chr20_40000000_50000000=10000000
+```
+
+Together these prove: (1) no race conditions, (2) batching is a
+no-op on output, (3) parallel output matches a clean serial
+reference at the row level modulo a single documented kernel
+divergence, (4) every row is internally consistent. This is the
+correctness floor we hold against future kernel work (arena
+allocator, GPU port).
 
 ###### Implications
 
