@@ -2109,6 +2109,141 @@ clusters of overlapping alignment candidates that the 10 Mbp run
 doesn't. This is exactly what the recheck exists for; you can see
 it via `gapped extensions / 2 − ran ydrop_align`.
 
+###### T2: per-thread scratch pool (arena for the sane impl)
+
+The T1 1-thread number is 1.42× slower per call than lastz-native
+because the sane impl mallocs ~8 scratch buffers per impl call
+(C_prev / C_curr / D_prev / D_curr / lnkTape / lnkRow / LY / RY),
+called twice per anchor (left + right) — ~16 mallocs per anchor,
+thousands of anchors per query. T2 replaces this with a
+per-thread reusable scratch struct (`ydrop_scratch`) that grows
+its buffers in-place on first use and reuses them on subsequent
+calls. Code lives in `lastz/src/ydrop_sane.{h,c}` next to the
+existing impls.
+
+###### Design
+
+- `ydrop_one_sided_align_impl_sane_double_buffered_pooled()`:
+  same algorithm, byte-identical observable behavior, but takes
+  a `ydrop_scratch*` and grows the seven persistent buffers via
+  `realloc_or_die` when they're too small (lnkTape mid-call growth
+  is also realloc-on-scratch, so the high-water mark survives).
+  After the first call sizes everything to the workload's peak,
+  every later call hits the reuse path.
+- `gapped_extend.c` keeps a static array
+  `parallel_ydrop_scratches[max_threads]`. Allocated lazily before
+  the first parallel region (single-threaded, no race). Inside
+  the parallel-for, each thread uses
+  `parallel_ydrop_scratches[omp_get_thread_num()]`, creating its
+  slot lazily on first use. No locks — only the owning thread
+  touches its slot.
+- A/B switch: `LASTZ_YDROP_POOL=0` falls back to per-call malloc
+  (calls the unpooled `ydrop_one_sided_align_impl_sane_double_-
+  buffered`). Used to attribute speedup to the pool vs the
+  parallelism. Default ON when `LASTZ_PARALLEL_YDROP` is on.
+
+###### Correctness
+
+All four validation checks (§ "Output correctness" above) still
+pass after T2. The pooled and unpooled impls produce
+**bit-identical output** at every (K, threads, pool=ON/OFF)
+configuration on the 1 Mbp slice — md5 `f237be56…` matches the
+pre-arena baseline exactly. The pooled variant is a memory-
+layout optimization; the algorithm is unchanged.
+
+###### Mouse-rat 1 Mbp × 10 Mbp strong-scaling, arena ON
+
+| threads | total wall | gapped ext | seed search | CPU%   | maxRSS   | speedup (gext) |
+|--------:|-----------:|-----------:|------------:|-------:|---------:|---------------:|
+| base    |     8.64 s |     4.88 s |     3.59 s  |   99%  |  101 MB  |     1.00×      |
+| 1       |    19.12 s |    15.21 s |     3.56 s  |   99%  |  248 MB  |     0.32×      |
+| 2       |    11.73 s |     8.11 s |     3.64 s  |  167%  |  391 MB  |     0.60×      |
+| 4       |     8.20 s |     4.35 s |     3.58 s  |  262%  |  675 MB  |     1.12×      |
+| 8       |     6.77 s |     2.96 s |     3.63 s  |  371%  | 1243 MB  |     1.65×      |
+| 16      |     6.13 s |     2.15 s |     3.40 s  |  559%  | 2370 MB  |     2.27×      |
+| 32      | **5.86 s** | **2.02 s** |     3.59 s  |  991%  | 4608 MB  |   **2.42×**    |
+| 40      |     6.51 s |     2.11 s |     3.41 s  | 1086%  | 5724 MB  |     2.31×      |
+
+- **Total wall speedup 1.47× at t=32** (up from 1.24× T1 pre-arena
+  at t=16).
+- **Gapped extension speedup 2.42× vs lastz-native baseline at
+  t=32** (up from 1.22× T1 pre-arena at t=32). The kernel is now
+  faster per call AND scales further.
+- **Memory dropped at every thread count** — t=32 uses 4.6 GB
+  vs 4.8 GB pre-arena, t=8 uses 1.24 GB vs 1.53 GB. Buffer reuse
+  is cheaper than glibc's per-call malloc/free even on the
+  high-water mark.
+
+###### A/B isolation: pool vs parallelism
+
+At fixed thread count, arena ON vs OFF separates malloc savings
+from parallel scaling. Numbers on the same 1 Mbp slice:
+
+| config            | gapped ext | vs baseline | vs arena-OFF same t |
+|-------------------|-----------:|------------:|--------------------:|
+| baseline (native) |    4.88 s  |    1.00×    |         —           |
+| POOL=0 t=1        |   21.61 s  |    0.23×    |       1.00×         |
+| POOL=1 t=1        |   15.21 s  |    0.32×    |     **1.42×**       |
+| POOL=0 t=8        |    4.65 s  |    1.05×    |       1.00×         |
+| POOL=1 t=8        |    2.96 s  |    1.65×    |     **1.57×**       |
+| POOL=0 t=32       |    4.01 s  |    1.22×    |       1.00×         |
+| POOL=1 t=32       |    2.02 s  |    2.42×    |     **1.99×**       |
+
+- **At t=1, pool alone is 1.42× faster.** Pure malloc savings —
+  no parallel work, just reused buffers. That's the answer to
+  "how much was malloc/free costing us in the sane impl".
+- **At t=32, pool alone (vs no-pool same threads) is 1.99×
+  faster.** With per-call malloc, all 32 threads serialized
+  through glibc's allocator and the kernel didn't scale past
+  t=8. With the pool, each thread runs lock-free on its own
+  buffers and the kernel scales out to t=32.
+
+###### Implications updated
+
+- **Sane-impl is now faster than lastz-native at every thread
+  count ≥ 8.** Gapped extension 2.02 s at t=32 vs 4.88 s lastz-
+  native. The "47 ms/call" sane-impl per-call cost from T1 is
+  closed: with pooled buffers it's ~5–6 ms/call amortized.
+- **Seed search is now the obvious next ceiling.** On the 1 Mbp
+  regime it's 61% of post-arena wall (3.59 s of 5.86 s). Same
+  shape that segalign attacks on GPU. The remaining gapped
+  extension at 2 s is the floor for CPU.
+- **Memory cost is bounded and grow-only.** Each thread holds
+  its peak-size buffers; high-water mark sets the per-thread
+  steady-state footprint. On 10 Mbp the per-thread arena would
+  be larger but still linear in N.
+
+###### Reproduce T2
+
+```bash
+cd lastz/src && make clean && make lastz lastz_T omp=ON && cd ../..
+
+# 1Mbp slice (regenerate if missing)
+python3 bench/slice_genome.py bench/data_genomes/mm10.chr10.fa \
+        bench/data_genomes/mm10.chr10_40_41mb.fa \
+        --start 40000000 --length 1000000
+
+# Arena ON (default) strong-scaling sweep
+for t in 1 2 4 8 16 32 40; do
+    LASTZ_PARALLEL_YDROP=64 OMP_NUM_THREADS=$t \
+      /usr/bin/time -f "wall=%es user=%Us cpu=%P maxRSS=%MkB" \
+      ./lastz/src/lastz_T bench/data_genomes/mm10.chr10_40_41mb.fa \
+                          bench/data_genomes/rn6.chr20_40_50mb.fa \
+                          --allocate:traceback=500M --format=general \
+                          --output=/tmp/arena.t$t.out
+done
+
+# A/B against per-call malloc
+LASTZ_PARALLEL_YDROP=64 OMP_NUM_THREADS=32 LASTZ_YDROP_POOL=0 \
+  ./lastz/src/lastz_T bench/data_genomes/mm10.chr10_40_41mb.fa \
+                      bench/data_genomes/rn6.chr20_40_50mb.fa \
+                      --allocate:traceback=500M --format=general \
+                      --output=/tmp/arena.off.t32.out
+
+# Correctness gate: all md5sums must match across the sweep
+md5sum /tmp/arena.t*.out /tmp/arena.off.t32.out
+```
+
 ###### If parallel mode reports CPU=99% on every thread count
 
 That means OpenMP is linked but the parallel-for isn't actually
