@@ -2061,6 +2061,91 @@ for t in 1 2 4 8 16 32 40; do
 done
 ```
 
+###### Faster iteration: 1 Mbp × 10 Mbp slice
+
+The full 10 Mbp × 10 Mbp run is ~35 s per data point, which is
+slow for iterating on kernel changes (arena allocator, GPU port,
+etc). A `1 Mbp query × 10 Mbp target` slice on the same dense
+mouse-rat regime gives ~7–25 s per data point with the parallel
+path still exercising 452 y-drop calls and 3489 anchors — plenty
+of work to see scaling.
+
+Diagonal 1 Mbp × 1 Mbp slices don't work — mouse-rat synteny isn't
+diagonal at that scale and most produce 0 alignments. The
+1 Mbp × 10 Mbp shape is what catches the cross-position
+orthology. Generate:
+
+```bash
+python3 bench/slice_genome.py bench/data_genomes/mm10.chr10.fa \
+        bench/data_genomes/mm10.chr10_40_41mb.fa \
+        --start 40000000 --length 1000000
+```
+
+The rat side stays at the existing 10 Mbp slice
+(`bench/data_genomes/rn6.chr20_40_50mb.fa`). Measured strong
+scaling on sapling2 (40 cores, no SLURM cap), `--allocate:traceback=500M`:
+
+| threads  | wall   | user   | CPU%   | maxRSS    | speedup vs base |
+|---------:|-------:|-------:|-------:|----------:|----------------:|
+| baseline |  8.76s |  8.7s  |   99%  |   101 MB  |      1.00×      |
+| 1        | 25.53s | 18.2s  |   99%  |   295 MB  |      0.34×      |
+| 2        | 14.27s | 18.5s  |  171%  |   484 MB  |      0.61×      |
+| 4        | 10.47s | 19.1s  |  284%  |   785 MB  |      0.84×      |
+| 8        |  8.04s | 22.5s  |  431%  |  1531 MB  |      1.09×      |
+| 16       |  7.09s | 26.4s  |  616%  |  2835 MB  |      1.24×      |
+| 32       |  8.26s | 34.3s  |  925%  |  4794 MB  |      1.06×      |
+| 40       |  8.76s | 39.3s  | 1057%  |  6338 MB  |      1.00×      |
+
+Same shape as the 10 Mbp run: 1-thread parallel is ~3× slower than
+baseline (sane-impl malloc overhead), 16 threads is the sweet
+spot, 32-40 starts to lose to overhead and contention. Best total
+wall speedup 1.24× — same regime, smaller proof point. Bit-
+identical output across t=1..40 (`md5sum f237be56…`).
+
+Also: in this regime in-batch shadowing actually fires. Of the
+629 y-drops Phase 2 runs, ~177 (28 %) are suppressed by the Phase
+3 in-batch containment recheck — the 1 Mbp query produces
+clusters of overlapping alignment candidates that the 10 Mbp run
+doesn't. This is exactly what the recheck exists for; you can see
+it via `gapped extensions / 2 − ran ydrop_align`.
+
+###### If parallel mode reports CPU=99% on every thread count
+
+That means OpenMP is linked but the parallel-for isn't actually
+spreading work across cores — only one core is busy regardless of
+`OMP_NUM_THREADS`. Symptoms: identical user-CPU time at every
+thread count, wall time flat (or modestly decreasing once and
+then flat), `maxRSS` *does* grow linearly with threads (each
+thread spawns and allocates its own scratch arena, but they
+serialize).
+
+Confirmed-good behaviour is `CPU%` rising as `100% × threads` (e.g.
+`925%` at t=32). To diagnose a stuck-at-99% box:
+
+```bash
+# 1. how many CPUs does the kernel say this process is allowed on?
+hostname
+nproc
+taskset -p $$            # affinity mask, should be all-1s on a normal host
+
+# 2. is the binary actually OpenMP-built?
+ldd ./lastz/src/lastz_T | grep gomp
+nm  ./lastz/src/lastz_T 2>/dev/null | grep -i 'GOMP_parallel\|omp_get_num' | head
+
+# 3. what does OpenMP think its team size is?
+OMP_DISPLAY_ENV=verbose OMP_NUM_THREADS=8 \
+  ./lastz/src/lastz_T --version 2>&1 | grep -i num_threads
+
+# 4. is something (cgroups, SLURM cgroup, container) capping CPU?
+cat /proc/self/status | grep -E 'Cpus_allowed|Cpus_allowed_list'
+cat /proc/self/cgroup 2>/dev/null
+```
+
+The most common cause on shared compute nodes is a leftover SLURM
+allocation (`$SLURM_JOB_ID` set, `$SLURM_CPUS_PER_TASK=1`) or
+cgroup CPU cap pinning the process to one core regardless of what
+`OMP_NUM_THREADS` says.
+
 #### Step-axis Pareto sweeps across five regimes
 
 After the seed-weight (bird-Z) and within-species (hg-vs-CHM13) sweeps
