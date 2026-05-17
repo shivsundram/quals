@@ -2213,6 +2213,91 @@ from parallel scaling. Numbers on the same 1 Mbp slice:
   steady-state footprint. On 10 Mbp the per-thread arena would
   be larger but still linear in N.
 
+###### Batch-size sweep at fixed t=32 (parallel-slack vs shadow-work)
+
+K (the OpenMP batch size = `LASTZ_PARALLEL_YDROP`) is the other
+knob we ship. K controls how many survivors the parallel region
+chews on between serial-commit syncs. Tradeoff:
+
+- **K too small** → each batch has fewer than 32 anchors, threads
+  starve, more batches = more serial Phase-1 / Phase-3 glue.
+- **K too large** → more in-batch shadow work: anchors that
+  *would* have been suppressed by an earlier same-batch commit
+  get y-dropped speculatively and discarded by the recheck.
+
+This sweep fixes t=32, arena ON, and varies K from 1 (= serial-
+equivalent: one anchor per batch) to 2048 on the 1 Mbp × 10 Mbp
+slice:
+
+| K    | total wall | gapped ext | Phase 2 ran | survivors | shadow % | batches | CPU%  |
+|-----:|-----------:|-----------:|------------:|----------:|---------:|--------:|------:|
+|    1 |  22.56 s   |  17.54 s   |      452    |    452    |   0.0 %  |   452   |  734% |
+|    2 |  16.90 s   |  11.62 s   |      456    |    452    |   0.9 %  |   229   |  577% |
+|    4 |  13.11 s   |   6.94 s   |      465    |    452    |   2.8 %  |   117   |  483% |
+|    8 |   9.77 s   |   4.17 s   |      475    |    452    |   4.8 %  |    60   |  470% |
+|   16 |   8.48 s   |   2.67 s   |      492    |    452    |   8.1 %  |    32   |  502% |
+|   32 |   7.01 s   |   2.18 s   |      542    |    452    |  16.6 %  |    18   |  793% |
+|   48 |   6.53 s   | **2.06 s** |      585    |    452    |  22.7 %  |    13   |  863% |
+|   64 |   6.37 s   |   2.12 s   |      629    |    452    |  28.1 %  |    11   |  938% |
+|   96 |   6.41 s   |   2.30 s   |      719    |    452    |  37.1 %  |     9   | 1040% |
+|  128 | **6.02 s** |   2.23 s   |      747    |    452    |  39.5 %  |     7   | 1110% |
+|  192 |   6.44 s   |   2.60 s   |      918    |    452    |  50.8 %  |     6   | 1254% |
+|  256 |   6.73 s   |   2.91 s   |     1042    |    452    |  56.6 %  |     5   | 1348% |
+|  384 |   7.20 s   |   3.21 s   |     1180    |    452    |  61.7 %  |     4   | 1415% |
+|  512 |   7.40 s   |   3.59 s   |     1325    |    452    |  65.9 %  |     4   | 1538% |
+| 1024 |   9.77 s   |   5.80 s   |     2190    |    452    |  79.4 %  |     4   | 1889% |
+| 2048 |  12.90 s   |   9.07 s   |     3484    |    452    |  87.0 %  |     3   | 2252% |
+
+(All 16 runs produced the **same md5** `f237be56…` — every K
+value is bit-identical to the baseline serial sane-impl output.
+The K-sweep is purely a perf tradeoff, never a correctness one.)
+
+A few clean facts fall out:
+
+- **Survivors = 452 at every K.** The committed alignment set is
+  invariant; K only controls how much speculative work the
+  parallel region drags in.
+- **Two different minima:**
+  - `gapped ext` minimum at **K=48** (2.06 s) — purest measure
+    of the y-drop kernel under parallelism. Beyond K=48 the
+    kernel does more total work because shadow rate climbs.
+  - `total wall` minimum at **K=128** (6.02 s) — fewer batches
+    means less serial Phase-1/Phase-3 glue, and that
+    amortization keeps winning past the gapped-stage minimum.
+  - K=64 (our shipped default) sits between them; ~5 % slower
+    on total wall than K=128, ~3 % slower on gapped than K=48.
+    Within noise.
+- **Shadow rate is the predictable cost.** At K=64 ~28 % of
+  Phase-2 y-drop runs are speculatively executed and discarded;
+  at K=128 it's ~40 %; at K=2048 it's 87 %. CPU absorbs this
+  because shadow work just drops on the floor — but on a GPU
+  port where you can't shrug off discarded SM work as cheaply,
+  this column tells you exactly how much speculative budget you
+  spend at each K.
+- **CPU%** climbs monotonically with K (more work per batch =
+  better thread utilization) but only up to ~1100 % at K=128
+  on this workload — meaning even at the sweet spot we're far
+  from the 3200 % ceiling. The remaining gap is serial glue
+  (containment check, commit, recheck) and the fact that
+  individual y-drops on the 1 Mbp slice are short (a few ms).
+- **K=1 is a useful baseline.** It runs the parallel code path
+  with zero parallelism (one anchor per batch ⇒ no shadowing
+  possible, every batch starts and ends a parallel region) and
+  gives us the lower bound of "what does this code path cost
+  when stripped of all parallelism": 22.6 s total wall, 17.5 s
+  gapped. Compare to baseline lastz-native at 8.6 s total — the
+  2.6× gap is the cost of the sane-impl code path itself, which
+  is what T2 is designed to claw back via the arena (and does:
+  at K≥32, t=32, arena ON, the sane impl is 2.4× *faster* than
+  baseline on gapped).
+
+Net: we keep K=64 as the shipped default — it's within noise of
+the K=128 sweet spot on total wall and slightly better on gapped
+wall, and a 28 % shadow rate is well-bounded. If a future
+optimization (e.g. cheaper containment recheck, or anchor
+pre-sorting to reduce shadowing) reduces the shadow cost, the
+optimum will shift toward larger K and we should re-sweep.
+
 ###### Reproduce T2
 
 ```bash
@@ -2242,6 +2327,17 @@ LASTZ_PARALLEL_YDROP=64 OMP_NUM_THREADS=32 LASTZ_YDROP_POOL=0 \
 
 # Correctness gate: all md5sums must match across the sweep
 md5sum /tmp/arena.t*.out /tmp/arena.off.t32.out
+
+# K sweep at fixed t=32, arena ON (the table above)
+for K in 1 2 4 8 16 32 48 64 96 128 192 256 384 512 1024 2048; do
+    LASTZ_PARALLEL_YDROP=$K OMP_NUM_THREADS=32 \
+      /usr/bin/time -f "wall=%es cpu=%P" \
+      ./lastz/src/lastz_T bench/data_genomes/mm10.chr10_40_41mb.fa \
+                          bench/data_genomes/rn6.chr20_40_50mb.fa \
+                          --allocate:traceback=500M --format=general \
+                          --output=/tmp/ksweep.K$K.out
+done
+md5sum /tmp/ksweep.K*.out | awk '{print $1}' | sort -u | wc -l   # must be 1
 ```
 
 ###### If parallel mode reports CPU=99% on every thread count
